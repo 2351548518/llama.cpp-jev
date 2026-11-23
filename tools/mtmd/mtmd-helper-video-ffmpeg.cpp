@@ -142,9 +142,9 @@ struct ffmpeg_video {
     uint32_t src_width     = 0;
     uint32_t src_height    = 0;
     double   video_start_s = 0.0;
+    bool     fixed_rate    = false;
 
     std::vector<float>   pcm;
-    size_t               pcm_start = 0;
     std::vector<uint8_t> skip_buf;
 
     // must be destroyed before input_buf, which its feeder thread reads
@@ -161,7 +161,7 @@ struct ffmpeg_video {
         std::vector<const char *> cmd = {
             ffprobe_bin.c_str(),
             "-v", "quiet",
-            "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate,nb_frames,duration,start_time:stream_side_data=rotation",
+            "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate,avg_frame_rate,nb_frames,duration,start_time:side_data=rotation:stream_tags=rotate",
             "-select_streams", "v:0",
             "-of", "default=noprint_wrappers=1",
         };
@@ -192,6 +192,7 @@ struct ffmpeg_video {
         int sar_num  = 1;
         int sar_den  = 1;
         int rotation = 0;
+        float avg_fps = 0.0f;
         char line[256];
         FILE * fp = probe_sp.stdout_pipe();
 
@@ -210,6 +211,8 @@ struct ffmpeg_video {
                 info.height = (uint32_t)atoi(val);
             } else if (strcmp(key, "r_frame_rate") == 0) {
                 info.fps = parse_rational(val);
+            } else if (strcmp(key, "avg_frame_rate") == 0) {
+                avg_fps = parse_rational(val);
             } else if (strcmp(key, "nb_frames") == 0 && strcmp(val, "N/A") != 0) {
                 info.n_frames = atoi(val);
             } else if (strcmp(key, "duration") == 0 && strcmp(val, "N/A") != 0) {
@@ -220,12 +223,17 @@ struct ffmpeg_video {
                 if (sscanf(val, "%d:%d", &sar_num, &sar_den) != 2) {
                     sar_num = sar_den = 1; // N/A
                 }
-            } else if (strcmp(key, "rotation") == 0) {
+            } else if (strcmp(key, "rotation") == 0 || strcmp(key, "TAG:rotate") == 0) {
                 rotation = atoi(val);
             }
         }
 
         probe_sp.stop();
+
+        // Rawvideo output can duplicate frames during rate conversion. Select by source
+        // index only when the probe reports a fixed cadence starting at zero.
+        fixed_rate = info.fps > 0.0f && info.fps == avg_fps && video_start_s == 0.0 && info.n_frames > 0 &&
+            std::abs((double) info.duration * info.fps - info.n_frames) < 0.5;
 
         // ffmpeg gives frames of the encoded size; the displayed size also has the pixel aspect ratio applied
         src_width  = info.width;
@@ -242,7 +250,11 @@ struct ffmpeg_video {
         return info.width > 0 && info.height > 0 && info.fps > 0.0f;
     }
 
-    void load_soundtrack(int rate) {
+    void load_soundtrack(int rate, size_t max_samples = SIZE_MAX) {
+        const double offset = std::nearbyint(video_start_s * rate);
+        if (!std::isfinite(offset) || offset >= (double) SIZE_MAX) {
+            return;
+        }
         const std::string rate_str = std::to_string(rate);
         std::vector<const char *> cmd = {ffmpeg_bin.c_str(), "-nostdin"};
         cmd.reserve(20); // GCC 11 -Wstringop-overflow false positive on the inserts below otherwise
@@ -263,17 +275,22 @@ struct ffmpeg_video {
             audio_sp.start_feeder(input_buf);
         }
         float block[4096];
+        FILE * out = audio_sp.stdout_pipe();
+        size_t skip = (size_t) std::max(0.0, offset);
+        while (skip > 0) {
+            const size_t n = fread(block, sizeof(float), std::min(skip, (size_t) 4096), out);
+            if (n == 0) {
+                return;
+            }
+            skip -= n;
+        }
         size_t n;
-        while ((n = fread(block, sizeof(float), 4096, audio_sp.stdout_pipe())) > 0) {
+        while (pcm.size() < max_samples && (n = fread(block, sizeof(float), std::min(max_samples - pcm.size(), (size_t) 4096), out)) > 0) {
             pcm.insert(pcm.end(), block, block + n);
         }
-        audio_sp.stop();
-
-        // align to the first video frame
-        pcm_start = std::min(pcm.size(), (size_t) std::max(0.0, std::nearbyint(video_start_s * rate)));
     }
 
-    bool start(uint32_t width, uint32_t height, float fps) {
+    bool start(uint32_t width, uint32_t height, float fps, std::string vf = {}, size_t n_selected = 0) {
         std::vector<const char *> cmd;
         cmd.push_back(ffmpeg_bin.c_str());
 
@@ -289,22 +306,31 @@ struct ffmpeg_video {
         cmd.push_back(is_buf_input() ? "cache:pipe:0" : path.c_str());
 
         const bool scale = width != src_width || height != src_height;
-        char vf[160] = "";
+        char filter[160] = "";
         if (fps > 0.0f) {
             if (scale) {
-                snprintf(vf, sizeof(vf), "fps=%.6f,scale=%u:%u", fps, width, height);
+                snprintf(filter, sizeof(filter), "fps=%.6f,scale=%u:%u", fps, width, height);
             } else {
-                snprintf(vf, sizeof(vf), "fps=%.6f", fps);
+                snprintf(filter, sizeof(filter), "fps=%.6f", fps);
             }
         } else if (scale) {
             // B=0 C=0.5 bicubic on RGB is closest to Pillow
-            snprintf(vf, sizeof(vf),
+            snprintf(filter, sizeof(filter),
                     "format=rgb24,scale=%u:%u:flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5",
                     width, height);
         }
-        if (vf[0]) {
-            cmd.push_back("-vf");
-            cmd.push_back(vf);
+        if (filter[0]) {
+            if (!vf.empty()) {
+                vf += ',';
+            }
+            vf += filter;
+        }
+        if (!vf.empty()) {
+            cmd.insert(cmd.end(), {"-vf", vf.c_str()});
+        }
+        const std::string count = std::to_string(n_selected);
+        if (n_selected > 0) {
+            cmd.insert(cmd.end(), {"-vsync", "0", "-frames:v", count.c_str()});
         }
 
         cmd.push_back("-f");
@@ -386,6 +412,28 @@ bool ffmpeg_start(void * state, uint32_t width, uint32_t height, float fps, bool
     return static_cast<ffmpeg_video *>(state)->start(width, height, fps);
 }
 
+bool ffmpeg_start_selected(void * state, uint32_t width, uint32_t height, const int32_t * indices, size_t n_indices) {
+    auto * video = static_cast<ffmpeg_video *>(state);
+    if (!video->fixed_rate) {
+        return false;
+    }
+
+    std::string filter = "select=";
+    int32_t previous = -1;
+    size_t count = 0;
+    for (size_t i = 0; i < n_indices; i++) {
+        if (indices[i] == previous) {
+            continue;
+        }
+        if (count++ > 0) {
+            filter += '+';
+        }
+        filter += "eq(n\\," + std::to_string(indices[i]) + ")";
+        previous = indices[i];
+    }
+    return video->start(width, height, 0.0f, std::move(filter), count);
+}
+
 bool ffmpeg_read_frame(void * state, unsigned char * rgb, uint32_t width, uint32_t height) {
     auto * v = static_cast<ffmpeg_video *>(state);
     if (!v->sp.alive) {
@@ -398,13 +446,16 @@ bool ffmpeg_read_frame(void * state, unsigned char * rgb, uint32_t width, uint32
     return v->read(rgb, (size_t) width * height * 3);
 }
 
-const float * ffmpeg_read_audio(void * state, int sample_rate, size_t * n_samples) {
+const float * ffmpeg_read_audio_bounded(void * state, int sample_rate, size_t max_samples, size_t * n_samples) {
     auto * v = static_cast<ffmpeg_video *>(state);
     v->pcm.clear();
-    v->pcm_start = 0;
-    v->load_soundtrack(sample_rate);
-    *n_samples = v->pcm.size() - v->pcm_start;
-    return *n_samples > 0 ? v->pcm.data() + v->pcm_start : nullptr;
+    v->load_soundtrack(sample_rate, max_samples);
+    *n_samples = v->pcm.size();
+    return *n_samples > 0 ? v->pcm.data() : nullptr;
+}
+
+const float * ffmpeg_read_audio(void * state, int sample_rate, size_t * n_samples) {
+    return ffmpeg_read_audio_bounded(state, sample_rate, SIZE_MAX, n_samples);
 }
 
 void ffmpeg_close(void * state) {
@@ -421,6 +472,8 @@ const mtmd_helper_video_decoder * mtmd_helper_video_decoder_ffmpeg() {
         /* read_audio */ ffmpeg_read_audio,
         /* close      */ ffmpeg_close,
         /* user_data  */ nullptr,
+        /* read_audio_bounded */ ffmpeg_read_audio_bounded,
+        /* start_selected */ ffmpeg_start_selected,
     };
     return &decoder;
 }

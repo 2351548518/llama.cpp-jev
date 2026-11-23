@@ -25,9 +25,9 @@ class Qwen2VLModel(TextModel):
         super().set_gguf_parameters()
 
     def set_vocab(self):
-        try:
+        if (self.dir_model / "tokenizer.model").is_file():
             self._set_vocab_sentencepiece()
-        except FileNotFoundError:
+        else:
             self._set_vocab_gpt2()
 
     @classmethod
@@ -181,9 +181,7 @@ class Qwen25OmniModel(Qwen2VLVisionModel, Qwen25AudioModel):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
-
-        if name.startswith("thinker."):
-            name = name.replace("thinker.", "")
+        name = name.removeprefix("thinker.").removeprefix("model.")
 
         if not name.startswith("visual.") and not name.startswith("audio_tower."):
             return None

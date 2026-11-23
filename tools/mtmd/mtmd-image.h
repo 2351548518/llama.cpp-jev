@@ -38,7 +38,7 @@ struct mtmd_image_preprocessor {
     // frames of a video, which the video helper may have already sized
     virtual mtmd_image_preproc_out preprocess_video_frame(const mtmd_image_u8 & img) const { return preprocess(img); }
     // frame size of a video with n_frames sampled frames, as the reference video processor; false if none
-    virtual bool get_video_frame_size(int /*n_frames*/, int /*width*/, int /*height*/, mtmd_image_size & /*out*/) const { return false; }
+    virtual bool get_video_frame_size(int /*n_frames*/, int /*width*/, int /*height*/, mtmd_image_size & /*out*/, int /*max_tokens_per_frame*/) const { return false; }
 };
 
 /**
@@ -141,6 +141,15 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     static mtmd_image_size get_target_size(const mtmd_hparams & hparams, const mtmd_image_size & original_size);
     mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const override;
     virtual mtmd_image_size target_size(const mtmd_image_size & original_size) const { return get_target_size(hparams, original_size); }
+    mtmd_image_preproc_out resize_to(const mtmd_image_u8 & img, const mtmd_image_size & size) const;
+};
+
+struct mtmd_image_preprocessor_gemma4 : mtmd_image_preprocessor_dyn_size {
+    using mtmd_image_preprocessor_dyn_size::mtmd_image_preprocessor_dyn_size;
+    mtmd_image_size target_size(const mtmd_image_size & original_size) const override;
+    mtmd_image_preproc_out preprocess_video_frame(const mtmd_image_u8 & img) const override;
+
+    mtmd_image_size fixed_budget_size(const mtmd_image_size & original_size, int n_tokens) const;
 };
 
 // Kimi-K2.5 / K3.1 navit_resize_image: scale down to the patch limits, then pad bottom-right with black to a multiple of patch_size*n_merge
@@ -154,9 +163,8 @@ struct mtmd_image_preprocessor_qwen3vl : mtmd_image_preprocessor_dyn_size {
     using mtmd_image_preprocessor_dyn_size::mtmd_image_preprocessor_dyn_size;
     // the video helper sizes the frames (get_video_frame_size), they are only snapped to the grid
     mtmd_image_preproc_out preprocess_video_frame(const mtmd_image_u8 & img) const override;
-    bool get_video_frame_size(int n_frames, int width, int height, mtmd_image_size & out) const override;
+    bool get_video_frame_size(int n_frames, int width, int height, mtmd_image_size & out, int max_tokens_per_frame = 0) const override;
 
-    mtmd_image_preproc_out resize_to(const mtmd_image_u8 & img, const mtmd_image_size & size) const;
     // with temporal_factor > 1 it is the Qwen3-VL video variant over n_frames
     static mtmd_image_size smart_resize(int width, int height, int factor, int64_t min_pixels, int64_t max_pixels,
                                         int n_frames = 1, int temporal_factor = 1);

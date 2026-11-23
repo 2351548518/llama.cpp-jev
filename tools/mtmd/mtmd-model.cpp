@@ -954,6 +954,15 @@ struct mtmd_model_loader {
                         hparams.audio_window_len   = 400;
                         hparams.audio_hop_len      = 160;
 
+                        if (model.proj_type == PROJECTOR_TYPE_QWEN2A) {
+                            get_u32(KEY_A_CHUNK_SIZE, hparams.audio_chunk_size, false);
+                            if (hparams.audio_chunk_size < 0 || hparams.audio_chunk_size > 3000 || hparams.audio_chunk_size % 4 != 0) {
+                                throw std::runtime_error("invalid Qwen audio chunk size");
+                            }
+                            if (hparams.audio_chunk_size > 0) {
+                                hparams.warmup_audio_size = hparams.audio_chunk_size;
+                            }
+                        }
                         if (model.proj_type == PROJECTOR_TYPE_HIGGS_AUDIO) {
                             // each 4s chunk is encoded on its own
                             hparams.audio_chunk_len   = 4;
@@ -4940,7 +4949,7 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
                 }
 
                 // whisper downscales input token by half after conv1d
-                n_patches /= 2;
+                n_patches = (n_patches + (proj == PROJECTOR_TYPE_QWEN2A && hparams.audio_chunk_size > 0 ? 1 : 0)) / 2;
 
                 if (audio_has_avgpool()) {
                     // divide by 2 because of nn.AvgPool1d(2, stride=2)

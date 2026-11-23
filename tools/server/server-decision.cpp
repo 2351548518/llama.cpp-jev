@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <set>
 #include <stdexcept>
 
 static const char * decision_question_type_name(server_decision_question_type type) {
@@ -12,6 +13,7 @@ static const char * decision_question_type_name(server_decision_question_type ty
         case SERVER_DECISION_QUESTION_CHOICE: return "choice";
         case SERVER_DECISION_QUESTION_SCORE:  return "score";
         case SERVER_DECISION_QUESTION_NOUL:   return "noul";
+        case SERVER_DECISION_QUESTION_BOX:    return "box";
     }
     return "";
 }
@@ -153,6 +155,48 @@ void server_decision_context::init(const llama_model * model) {
             throw std::runtime_error("decision model has no valid max_head_tokens");
         }
         n_options_max = 255;
+    } else if (model_type == COMMON_DECISION_TYPE_LAYA_MULTIMODAL) {
+        const std::string key = prefix + "laya_config";
+        const int32_t len = llama_model_meta_val_str(model, key.c_str(), nullptr, 0);
+        if (len <= 0 || len > 65536) {
+            throw std::runtime_error("invalid Laya multimodal configuration size");
+        }
+        std::vector<char> buf(len + 1);
+        llama_model_meta_val_str(model, key.c_str(), buf.data(), buf.size());
+        laya_config = json::parse(buf.data());
+        const std::string readout = laya_config.at("readout");
+        laya_candidate = readout == "candidate";
+        laya_box = laya_config.contains("box_hidden");
+        laya_projection_size = laya_config.at("projection_size").get<int32_t>();
+        laya_scale = laya_config.value("scale", 1.0f);
+        const auto arch = decision_meta_str(model, "general.architecture");
+        const auto softcap = decision_meta_str(model, arch + ".final_logit_softcapping");
+        laya_softcap = softcap.empty() ? 0.0f : std::stof(softcap);
+        if (!laya_candidate) {
+            laya_video_template = MTMD_VIDEO_TEMPLATE_TIMED_IMAGES;
+        } else if (arch == "gemma4") {
+            laya_video_template = MTMD_VIDEO_TEMPLATE_GEMMA4;
+        } else if (arch == "qwen35") {
+            laya_video_template = MTMD_VIDEO_TEMPLATE_QWEN3VL_WRAPPED;
+        }
+        laya_image_min_tokens = laya_config.value("image_min_tokens", arch == "gemma4" ? 280 : arch == "qwen35" ? 64 : 0);
+        laya_image_max_tokens = laya_config.value("image_max_tokens", arch == "gemma4" ? 280 : arch == "qwen35" ? 16384 : 0);
+        if ((readout != "candidate" && readout != "letter") || laya_projection_size < 2 || laya_projection_size > 2048 ||
+            laya_projection_size + (laya_box ? 5 : 0) != llama_model_n_embd_out(model) ||
+            (laya_candidate && (laya_projection_size % 2 != 0 || !(laya_scale > 0.0f && laya_scale <= 100.001f))) ||
+            laya_image_min_tokens < 0 || laya_image_max_tokens < laya_image_min_tokens || laya_image_max_tokens > 32768 ||
+            laya_config.at("max_len").get<int64_t>() <= 0 ||
+            laya_config.at("frames").get<int64_t>() < 1 || laya_config.at("frames").get<int64_t>() > 256 ||
+            !(laya_config.at("max_audio_seconds").get<double>() > 0.0)) {
+            throw std::runtime_error("invalid Laya multimodal configuration");
+        }
+        if (!laya_candidate) {
+            const auto & symbols = laya_config.at("symbols");
+            if (!symbols.is_array() || symbols.size() != (size_t) laya_projection_size) {
+                throw std::runtime_error("Laya decision symbols do not match the readout");
+            }
+        }
+        n_options_max = laya_candidate ? 256 : laya_projection_size;
     } else if (model_type == COMMON_DECISION_TYPE_CLEF) {
         n_options_max   = 255;
         noul_true_first = true;
@@ -242,10 +286,20 @@ static bool decision_is_payload(const json & val) {
     return val.is_string() || val.is_object() || val.is_array();
 }
 
+static bool decision_laya_labels_equal(const json & a, const json & b) {
+    if (a.is_boolean() && b.is_number()) {
+        return json(static_cast<int>(a.get<bool>())) == b;
+    }
+    if (a.is_number() && b.is_boolean()) {
+        return a == json(static_cast<int>(b.get<bool>()));
+    }
+    return a == b;
+}
+
 std::vector<server_decision_question> server_decision_context::parse_questions(const json & body, bool support_audio_input) const {
     // lfm2-d1, lfm2-d1-omni, lfm3-d1 and vllm-d3 accept a null state, for example to ask about images only
     const bool null_state = type == COMMON_DECISION_TYPE_LFM2_D1 || type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI;
-    if (!body.contains("state") || (body.at("state").is_null() && !null_state)) {
+    if (!is_laya_multimodal() && (!body.contains("state") || (body.at("state").is_null() && !null_state))) {
         throw std::invalid_argument("\"state\" must be provided");
     }
     if (strict_payload && !decision_is_payload(body.at("state"))) {
@@ -278,7 +332,15 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         if (strict_payload && (!decision_is_payload(instructions) || instructions == "")) {
             throw err("\"instructions\" must be non-empty text, an object or an array");
         }
-        if ((type != COMMON_DECISION_TYPE_LFM3_D1_OMNI || !support_audio_input) && decision_is_spoken(instructions)) {
+        if (is_laya_multimodal()) {
+            if (string_strip(id).empty()) {
+                throw err("question id must be nonempty");
+            }
+            if (!(decision_is_payload(instructions) || instructions.is_number() || instructions.is_boolean()) ||
+                instructions.empty() || (instructions.is_string() && string_strip(instructions.get<std::string>()).empty())) {
+                throw err("instructions must be nonempty text, a number, a boolean, an object or an array");
+            }
+        } else if ((type != COMMON_DECISION_TYPE_LFM3_D1_OMNI || !support_audio_input) && decision_is_spoken(instructions)) {
             throw err("spoken instructions are only supported by lfm3-d1-omni with audio input");
         }
 
@@ -287,18 +349,43 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         question.instructions = instructions;
 
         const std::string type_name = json_value(q, "type", std::string(is_h2o ? "choice" : ""));
-        const json        criteria  = q.contains("criteria") ? q.at("criteria") : json();
+        json              criteria  = q.contains("criteria") ? q.at("criteria") : json();
+        if (is_laya_multimodal() && (type_name == "choice" || type_name == "score") && criteria.size() > n_options_max) {
+            throw err(string_format("too many options (%zu), this model supports at most %zu", criteria.size(), n_options_max));
+        }
 
-        if (type_name == "choice") {
-            question.type = SERVER_DECISION_QUESTION_CHOICE;
-            if (!criteria.is_object() || criteria.empty()) {
-                throw err("\"criteria\" must be a non-empty object");
+        if (type_name == "box" && is_laya_multimodal()) {
+            if (!laya_box) {
+                throw err("this checkpoint has no trained Box head");
             }
-            for (const auto & [key, description] : criteria.items()) {
-                if (strict_payload && (key.empty() || !(description.is_null() || decision_is_payload(description)))) {
-                    throw err("option keys must be non-empty, descriptions must be null, text, an object or an array");
+            if (q.size() != 2 || !instructions.is_string() || string_strip(instructions.get<std::string>()).empty()) {
+                throw err("Box takes only type and nonempty text instructions");
+            }
+            question.type = SERVER_DECISION_QUESTION_BOX;
+        } else if (type_name == "choice") {
+            question.type = SERVER_DECISION_QUESTION_CHOICE;
+            if (is_laya_multimodal() && criteria.is_array() && !criteria.empty()) {
+                std::set<std::string> keys;
+                for (const auto & item : criteria) {
+                    if (!item.is_string() && !item.is_number() && !item.is_boolean()) {
+                        throw err("choice labels must be strings, numbers or booleans");
+                    }
+                    const std::string key = item.is_string() ? item.get<std::string>() : item.dump();
+                    if (!keys.insert(key).second || (!item.is_string() && std::any_of(question.options.begin(), question.options.end(),
+                            [&](const auto & option) { return decision_laya_labels_equal(item, option.label); }))) {
+                        throw err("choice labels must be distinct");
+                    }
+                    question.options.push_back({key, nullptr, item});
                 }
-                question.options.push_back({key, description});
+            } else if (!criteria.is_object() || criteria.empty()) {
+                throw err("\"criteria\" must be a non-empty object");
+            } else {
+                for (const auto & [key, description] : criteria.items()) {
+                    if (strict_payload && (key.empty() || !(description.is_null() || decision_is_payload(description)))) {
+                        throw err("option keys must be non-empty, descriptions must be null, text, an object or an array");
+                    }
+                    question.options.push_back({key, description});
+                }
             }
             if (strict_payload && question.options.size() < 2) {
                 throw err("\"criteria\" must have at least 2 options");
@@ -311,13 +398,16 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         } else if (type_name == "score") {
             question.type = SERVER_DECISION_QUESTION_SCORE;
             // h2o-lightning: from 1 level, the maximum is n_options_max
-            if (is_h2o && (!criteria.is_array() || criteria.empty())) {
+            if ((is_h2o || is_laya_multimodal()) && (!criteria.is_array() || criteria.empty())) {
                 throw err("\"criteria\" must be a non-empty array");
             }
-            if (!is_h2o && (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10)) {
+            if (!is_h2o && !is_laya_multimodal() && (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10)) {
                 throw err("\"criteria\" must be an array of 2 to 10 levels");
             }
             for (size_t i = 0; i < criteria.size(); i++) {
+                if (is_laya_multimodal() && criteria.at(i).is_null()) {
+                    throw err("score levels cannot be null");
+                }
                 if (strict_payload && !decision_is_payload(criteria.at(i))) {
                     throw err("level descriptions must be text, an object or an array");
                 }
@@ -327,6 +417,18 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
             question.type = SERVER_DECISION_QUESTION_NOUL;
             if (!criteria.is_null() && !criteria.is_object()) {
                 throw err("\"criteria\" must be an object");
+            }
+            if (is_laya_multimodal() && criteria.is_object()) {
+                json normalized = json::object();
+                for (const auto & [key, description] : criteria.items()) {
+                    std::string lower = key;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+                    if (lower != "false" && lower != "true") {
+                        throw err("criteria may only describe false and true");
+                    }
+                    normalized[lower] = description;
+                }
+                criteria = std::move(normalized);
             }
             if (strict_payload && criteria.is_object()) {
                 for (const auto & [key, description] : criteria.items()) {
@@ -350,7 +452,7 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
                 std::swap(question.options[0], question.options[1]);
             }
         } else {
-            throw err("\"type\" must be one of: choice, score, noul");
+            throw err(is_laya_multimodal() ? "\"type\" must be one of: choice, score, noul, box" : "\"type\" must be one of: choice, score, noul");
         }
 
         // the classes are fixed: "0" is inconsistent, "1" is consistent
@@ -375,6 +477,36 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
 
         if (question.options.size() > n_options_max) {
             throw err(string_format("too many options (%zu), this model supports at most %zu", question.options.size(), n_options_max));
+        }
+        if (is_laya_multimodal() && q.contains("option_order")) {
+            const auto & order = q.at("option_order");
+            std::vector<bool> seen(question.options.size());
+            if (!order.is_array() || order.size() != seen.size()) {
+                throw err("option_order must be a permutation of the option indices");
+            }
+            for (const auto & item : order) {
+                if (!item.is_number_integer() || item.get<uint64_t>() >= seen.size() || seen[item.get<size_t>()]) {
+                    throw err("option_order must be a permutation of the option indices");
+                }
+                seen[item.get<size_t>()] = true;
+                question.option_order.push_back(item.get<size_t>());
+            }
+        }
+        if (is_laya_multimodal() && q.contains("labels")) {
+            const auto & labels = q.at("labels");
+            if (question.type != SERVER_DECISION_QUESTION_NOUL) {
+                throw err("labels are only supported for noul questions");
+            }
+            if (!labels.is_null()) {
+                if (!labels.is_object() || labels.size() != 2 || !labels.contains("false") || !labels.at("false").is_string() ||
+                    !labels.contains("true") || !labels.at("true").is_string()) {
+                    throw err("labels must map false and true to distinct nonempty text");
+                }
+                question.noul_labels = {string_strip(labels.at("false").get<std::string>()), string_strip(labels.at("true").get<std::string>())};
+                if (question.noul_labels[0].empty() || question.noul_labels[1].empty() || question.noul_labels[0] == question.noul_labels[1]) {
+                    throw err("labels must map false and true to distinct nonempty text");
+                }
+            }
         }
 
         questions.push_back(std::move(question));
@@ -435,7 +567,7 @@ json server_decision_context::parse_state(const json & body, std::vector<raw_buf
         throw std::invalid_argument(string_format("this model needs exactly 2 images (the original, then the rendered one), got %zu", files.size()));
     }
 
-    const json & state = body.at("state");
+    const json state = body.contains("state") ? body.at("state") : json();
     const bool is_wrapped = state.is_object() && state.contains("messages");
     const json & messages = is_wrapped ? state.at("messages") : state;
     if (!messages.is_array()) {
@@ -457,7 +589,7 @@ json server_decision_context::parse_state(const json & body, std::vector<raw_buf
             } else if (part.is_object() && json_value(part, "type", std::string()) == "input_audio" && part.contains("input_audio")) {
                 const json input_audio = json_value(part, "input_audio", json::object());
                 decision_load_audio(input_audio.contains("data") ? input_audio.at("data") : json_value(input_audio, "url", json()), files);
-            } else if (is_lfm3_d1() && part.is_object() && json_value(part, "type", std::string()) == "video_url" && part.contains("video_url")) {
+            } else if ((is_lfm3_d1() || is_laya_multimodal()) && part.is_object() && json_value(part, "type", std::string()) == "video_url" && part.contains("video_url")) {
                 const json & video_url = part.at("video_url");
                 decision_load_image(video_url.is_object() && video_url.contains("url") ? video_url.at("url") : video_url, files);
             } else {
@@ -475,6 +607,68 @@ json server_decision_context::parse_state(const json & body, std::vector<raw_buf
     json state_out = state;
     state_out["messages"] = messages_out;
     return state_out;
+}
+
+std::string server_decision_context::input_modality(
+        const json & state, const std::vector<raw_buffer> & files, mtmd_context * mctx, const mtmd_helper_init_opt & opt) const {
+    if (!is_laya_multimodal()) {
+        return files.empty() ? "text" : "image";
+    }
+    if (files.empty() && state.is_null()) {
+        throw std::invalid_argument("supply a state or media");
+    }
+    mtmd_helper_media_type kind = MTMD_HELPER_MEDIA_TYPE_UNKNOWN;
+    for (const auto & file : files) {
+        mtmd_helper_media_meta meta = {};
+        if (mtmd_helper_get_media_meta(file.data(), file.size(), opt, &meta) != 0 ||
+            meta.type == MTMD_HELPER_MEDIA_TYPE_UNKNOWN) {
+            throw std::invalid_argument("unknown Laya input media format");
+        }
+        if (meta.type == MTMD_HELPER_MEDIA_TYPE_AUDIO) {
+            if (!mtmd_support_audio(mctx)) {
+                throw std::invalid_argument("this Laya backbone has no native audio encoder");
+            }
+            if (meta.duration > laya_config.at("max_audio_seconds").get<double>()) {
+                throw std::invalid_argument("audio exceeds the Laya checkpoint's max_audio_seconds");
+            }
+        }
+        if (meta.type == MTMD_HELPER_MEDIA_TYPE_VIDEO && laya_video_template == MTMD_VIDEO_TEMPLATE_DEFAULT) {
+            throw std::invalid_argument("this Laya checkpoint has no native video processor");
+        }
+        kind = std::max(kind, meta.type);
+    }
+    switch (kind) {
+        case MTMD_HELPER_MEDIA_TYPE_VIDEO: return "video";
+        case MTMD_HELPER_MEDIA_TYPE_AUDIO: return "audio";
+        case MTMD_HELPER_MEDIA_TYPE_IMAGE: return "image";
+        default: return "text";
+    }
+}
+
+void server_decision_context::configure_media(mtmd_context_params & params) const {
+    if (!is_laya_multimodal()) {
+        return;
+    }
+    if (laya_image_min_tokens > 0 && params.image_min_tokens <= 0 && params.image_max_tokens <= 0) {
+        params.image_min_tokens = laya_image_min_tokens;
+        params.image_max_tokens = laya_image_max_tokens;
+    }
+    params.video_frames = laya_config.at("frames").get<int32_t>();
+    if (laya_video_template == MTMD_VIDEO_TEMPLATE_QWEN3VL_WRAPPED) {
+        params.video_max_tokens_per_frame = std::clamp(laya_config.value("video_max_tokens_per_frame", 768), 1, 32768);
+    }
+}
+
+void server_decision_context::configure_media(mtmd_helper_init_opt & opt) const {
+    if (is_laya_multimodal()) {
+        opt.video_params.no_soundtrack = !laya_config.value("use_audio_in_video", false);
+        opt.video_params.center_frames = laya_config.at("frames").get<int32_t>();
+        opt.video_params.prompt_template = laya_video_template;
+        opt.video_params.max_full_soundtrack_seconds = laya_config.at("max_audio_seconds").get<float>();
+    } else if (is_lfm3_d1()) {
+        // The reference decision model reads frames without a soundtrack.
+        opt.video_params.no_soundtrack = true;
+    }
 }
 
 //
@@ -1098,6 +1292,14 @@ json server_decision_context::render_options(const server_decision_question & qu
     return options;
 }
 
+static std::string decision_apply_template(const common_chat_template & tmpl, const json & input) {
+    jinja::context ctx(tmpl.source());
+    jinja::global_from_json(ctx, input, false);
+    jinja::runtime runtime(ctx);
+    const jinja::value result = runtime.execute(tmpl.prog);
+    return jinja::runtime::gather_string_parts(result)->as_string().str();
+}
+
 std::string server_decision_context::render(
         const json & state,
         const std::vector<server_decision_question> & questions,
@@ -1180,11 +1382,7 @@ std::string server_decision_context::render(
         inp["instructions"] = get_media_marker();
     }
 
-    jinja::context ctx(tmpl->source());
-    jinja::global_from_json(ctx, inp, false);
-    jinja::runtime runtime(ctx);
-    const jinja::value results = runtime.execute(tmpl->prog);
-    return jinja::runtime::gather_string_parts(results)->as_string().str();
+    return decision_apply_template(*tmpl, inp);
 }
 
 void server_decision_context::fill_task(
@@ -1192,32 +1390,29 @@ void server_decision_context::fill_task(
         const std::vector<server_decision_question> & questions,
         const server_decision_question & question,
         size_t variant,
-        const std::vector<raw_buffer> & files,
-        mtmd_context * mctx,
-        const mtmd_helper_init_opt & init_opt,
+        server_mtmd_input & input,
         server_task & task) const {
+    const auto & files = input.files;
+    if (is_laya_multimodal()) {
+        fill_task_laya_multimodal(state, question, input, task);
+        return;
+    }
     // each question has its own prompt, with the spans that the head reads
     if (type == COMMON_DECISION_TYPE_VLLM_DECISION2) {
-        fill_task_joint(state, { question }, files, mctx, init_opt, task);
+        fill_task_joint(state, { question }, input, task);
         return;
     }
     if (type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
-        fill_task_d1omni(state, questions, question, variant, files, mctx, init_opt, task);
+        fill_task_d1omni(state, questions, question, variant, input, task);
         return;
     }
 
     const std::string prompt = render(state, questions, question, variant, files.size());
 
     if (type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV) {
-        task.tokens          = process_mtmd_prompt(mctx, prompt, files, init_opt);
+        task.tokens          = input.tokenize(prompt);
         task.decision.pooled = true;
         return;
-    }
-
-    std::vector<raw_buffer> media = files;
-    if (decision_is_spoken(question.instructions)) {
-        const json audio = json_value(question.instructions, "input_audio", json::object());
-        decision_load_audio(audio.contains("data") ? audio.at("data") : json(), media);
     }
 
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_GRANITE_SWITCH || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 ||
@@ -1238,11 +1433,15 @@ void server_decision_context::fill_task(
     }
     if (type == COMMON_DECISION_TYPE_OPENJEV || type == COMMON_DECISION_TYPE_LEV || type == COMMON_DECISION_TYPE_NIMBLE || type == COMMON_DECISION_TYPE_PPLX_DECIDER || type == COMMON_DECISION_TYPE_VLLM_D3 || type == COMMON_DECISION_TYPE_LFM2_D1 ||
         type == COMMON_DECISION_TYPE_H2O_LIGHTNING || type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI) {
-        if (!media.empty()) {
-            // the d1 reference sees the frames of a video, not its soundtrack
-            mtmd_helper_init_opt opt = init_opt;
-            opt.video_params.no_soundtrack = is_lfm3_d1();
-            task.tokens = process_mtmd_prompt(mctx, prompt, media, opt);
+        if (decision_is_spoken(question.instructions)) {
+            auto media = files;
+            const json audio = json_value(question.instructions, "input_audio", json::object());
+            decision_load_audio(audio.contains("data") ? audio.at("data") : json(), media);
+            task.tokens = process_mtmd_prompt(input.ctx, prompt, media, input.options);
+            return;
+        }
+        if (!files.empty()) {
+            task.tokens = input.tokenize(prompt);
             return;
         }
     }
@@ -1323,6 +1522,133 @@ void server_decision_context::fill_task_laya(llama_tokens & tokens, const server
     task.decision.column = question.type;
 }
 
+static std::string decision_laya_text(const json & value) {
+    return value.is_string() ? value.get<std::string>() : decision_py_dumps(value, -1, ", ", ": ", false);
+}
+
+static bool decision_laya_option_code(const std::string & key) {
+    if (key.empty()) {
+        return false;
+    }
+    if (key.size() == 1 && ((key[0] >= 'A' && key[0] <= 'Z') || (key[0] >= 'a' && key[0] <= 'z'))) {
+        return true;
+    }
+    const size_t start = key[0] == 'c' ? 1 : 0;
+    return start < key.size() && std::all_of(key.begin() + start, key.end(), [](char c) {
+        return c >= '0' && c <= '9';
+    });
+}
+
+void server_decision_context::fill_task_laya_multimodal(
+        const json & state, const server_decision_question & question, server_mtmd_input & input, server_task & task) const {
+    const bool is_box = question.type == SERVER_DECISION_QUESTION_BOX;
+    const bool prompt_v2 = laya_config.value("prompt_version", std::string("v1")) == "v2";
+    const bool state_first = is_box || laya_candidate || prompt_v2;
+    const std::string state_text = "State: " + (state.is_null() ? "" : decision_laya_text(state));
+    std::string text = state_first ? state_text + "\n" : "";
+    std::vector<std::pair<size_t, size_t>> spans;
+    if (is_box) {
+        text += "Locate in the image: " + decision_laya_text(question.instructions) + "\nReturn the target bounding box.";
+    } else {
+        text += decision_question_type_name(question.type) + std::string(" question: ") + decision_laya_text(question.instructions) + "\n";
+        if (laya_candidate) {
+            text += "Options:\n";
+        }
+        std::vector<std::string> symbols;
+        for (size_t slot = 0; slot < question.options.size(); slot++) {
+            const size_t idx = question.option_order.empty() ? slot : question.option_order[slot];
+            const auto & opt = question.options[idx];
+            const bool has_description = !opt.description.is_null() && opt.description != "";
+            const std::string description = has_description ? decision_laya_text(opt.description) : "";
+            std::string rendered;
+            switch (question.type) {
+                case SERVER_DECISION_QUESTION_CHOICE:
+                    if (!has_description) {
+                        rendered = opt.label.is_boolean() ? (opt.label.get<bool>() ? "True" : "False") : opt.key;
+                    } else if ((laya_candidate && decision_laya_option_code(opt.key)) || (!laya_candidate && prompt_v2)) {
+                        rendered = description;
+                    } else {
+                        rendered = opt.key + ": " + description;
+                    }
+                    break;
+                case SERVER_DECISION_QUESTION_SCORE:
+                    rendered = "level " + opt.key + ": " + decision_laya_text(opt.description);
+                    break;
+                case SERVER_DECISION_QUESTION_NOUL:
+                    rendered = (question.noul_labels.empty() ? opt.key : question.noul_labels[idx]) + ": ";
+                    rendered += has_description ? description : idx == 0 ? "no, the statement does not hold" : "yes, the statement holds";
+                    break;
+                case SERVER_DECISION_QUESTION_BOX:
+                    break;
+            }
+            if (laya_candidate) {
+                text += "Candidate " + std::to_string(slot + 1) + ": " + rendered;
+                spans.emplace_back(text.size(), text.size() + 3);
+                text += " ->\n";
+            } else {
+                symbols.push_back(laya_config.at("symbols").at(slot).get<std::string>());
+                text += symbols.back() + ": " + rendered + "\n";
+            }
+        }
+        if (laya_candidate) {
+            text += "Decide using the full state, question and candidates.";
+        } else if (prompt_v2) {
+            text += "Return only one answer label from: " + string_join(symbols, ", ") + ".";
+        } else {
+            text += state_text + "\nSelect exactly one option. Answer with its letter or digit only.";
+        }
+    }
+
+    const std::string marker = get_media_marker();
+    if (!input.files.empty() && text.find(marker) != std::string::npos) {
+        throw std::invalid_argument("Laya text contains the reserved media marker");
+    }
+    const json images = std::vector<std::string>(input.files.size(), marker);
+    const std::string prompt = decision_apply_template(*tmpl, {{"images", images}, {"prompt", text}});
+    task.tokens = input.tokenize(prompt, laya_config.value("add_special", false));
+    if (task.tokens.empty() || task.tokens.size() > laya_config.at("max_len").get<size_t>()) {
+        throw std::invalid_argument("Laya input exceeds the checkpoint's token budget");
+    }
+
+    if (is_box || !laya_candidate) {
+        task.decision.column = is_box ? laya_projection_size : 0;
+        task.decision.n_values = is_box ? 5 : question.options.size();
+        return;
+    }
+
+    const size_t start = prompt.rfind(text);
+    if (start == std::string::npos) {
+        throw std::runtime_error("Laya chat template changed the candidate text");
+    }
+    // The candidate suffix is text even when media before it expand to many tokens.
+    size_t offset = prompt.size();
+    size_t remaining = spans.size();
+    task.decision.markers.resize(remaining);
+    for (size_t i = task.tokens.size(); i > 0 && remaining > 0; i--) {
+        if (task.tokens[i - 1] == LLAMA_TOKEN_NULL) {
+            break;
+        }
+        const auto piece = common_token_to_piece(vocab, task.tokens[i - 1], true);
+        const size_t end = offset;
+        if (piece.size() > offset || prompt.compare(offset - piece.size(), piece.size(), piece) != 0) {
+            break;
+        }
+        offset -= piece.size();
+        const auto & span = spans[remaining - 1];
+        if (offset >= start + span.first && end <= start + span.second && offset != end) {
+            task.decision.markers[--remaining] = i - 1;
+        } else if (offset < start + span.first) {
+            break;
+        }
+    }
+    if (remaining != 0) {
+        throw std::invalid_argument("could not resolve a Laya candidate token");
+    }
+    task.decision.pointer = task.tokens.size() - 1;
+    task.decision.pointer_dim = laya_projection_size / 2;
+    task.decision.pointer_scale = laya_scale;
+}
+
 // each piece is cut to its budget as the model was trained (d1-omni prompt.py: encode), the state gets the room that is left
 // the media come first, the text after them has a budget of its own
 void server_decision_context::fill_task_d1omni(
@@ -1330,11 +1656,10 @@ void server_decision_context::fill_task_d1omni(
         const std::vector<server_decision_question> & questions,
         const server_decision_question & question,
         size_t variant,
-        const std::vector<raw_buffer> & files,
-        mtmd_context * mctx,
-        const mtmd_helper_init_opt & init_opt,
+        server_mtmd_input & input,
         server_task & task) const {
     const auto invalid = std::runtime_error("unexpected layout of the decision prompt");
+    const auto & files = input.files;
 
     // the prompt depends on the kind of media, mtmd tells an audio clip from an image by its content
     std::string markers;
@@ -1344,7 +1669,7 @@ void server_decision_context::fill_task_d1omni(
         for (size_t i = 0; i < files.size(); i++) {
             markers += get_media_marker();
         }
-        media = process_mtmd_prompt(mctx, markers, files, init_opt);
+        media = input.tokenize(markers);
         for (size_t i = 0; i < media.size(); i++) {
             if (media[i] == LLAMA_TOKEN_NULL) {
                 const auto & chunk = media.find_chunk(i);
@@ -1471,11 +1796,10 @@ size_t server_decision_context::set_size(const std::vector<server_decision_quest
 void server_decision_context::fill_task_set(
         const json & state,
         const std::vector<server_decision_question> & questions,
-        const std::vector<raw_buffer> & files,
-        mtmd_context * mctx,
-        const mtmd_helper_init_opt & init_opt,
+        server_mtmd_input & input,
         server_task & task) const {
     GGML_ASSERT(!questions.empty());
+    const auto & files = input.files;
 
     std::string head = D1_HEAD;
     for (size_t i = 0; i < files.size(); i++) {
@@ -1490,7 +1814,7 @@ void server_decision_context::fill_task_set(
     };
 
     // the first question is its lone prompt
-    fill_task(state, questions, questions[0], 0, files, mctx, init_opt, task);
+    fill_task(state, questions, questions[0], 0, input, task);
     const size_t n_first = common_tokenize(vocab, suffix(questions[0]), false, true).size();
     if (n_first >= task.tokens.size()) {
         throw std::runtime_error("unexpected layout of the decision prompt");
@@ -1525,10 +1849,9 @@ static const std::string CLEF_MARK_OPTION   = "<<clef:option>>";
 void server_decision_context::fill_task_joint(
         const json & state,
         const std::vector<server_decision_question> & questions,
-        const std::vector<raw_buffer> & files,
-        mtmd_context * mctx,
-        const mtmd_helper_init_opt & init_opt,
+        server_mtmd_input & input,
         server_task & task) const {
+    const auto & files = input.files;
     json inp_questions = json::array();
     for (const auto & question : questions) {
         json options = json::array();
@@ -1588,7 +1911,7 @@ void server_decision_context::fill_task_joint(
         if (head.find(get_media_marker()) == std::string::npos || head.find(CLEF_MARKER) != std::string::npos) {
             throw invalid;
         }
-        task.tokens = process_mtmd_prompt(mctx, head, files, init_opt);
+        task.tokens = input.tokenize(head);
         task.decision.order.resize(task.tokens.size(), LLAMA_DECISION_ORDER_NONE);
     }
 
@@ -1605,6 +1928,7 @@ void server_decision_context::fill_task_joint(
                 case SERVER_DECISION_QUESTION_NOUL:   order = LLAMA_DECISION_ORDER_QUESTION_NOUL;   break;
                 case SERVER_DECISION_QUESTION_CHOICE: order = LLAMA_DECISION_ORDER_QUESTION_CHOICE; break;
                 case SERVER_DECISION_QUESTION_SCORE:  order = LLAMA_DECISION_ORDER_QUESTION_SCORE;  break;
+                case SERVER_DECISION_QUESTION_BOX:    throw invalid;
             }
         } else if (string_starts_with(piece, CLEF_MARK_OPTION)) {
             piece = piece.substr(CLEF_MARK_OPTION.size());
@@ -1699,7 +2023,7 @@ static double decision_confidence_entropy(const std::vector<double> & probs) {
 }
 
 double server_decision_context::get_decision_confidence(server_decision_question_type question_type, const std::vector<double> & probs) const {
-    if (type == COMMON_DECISION_TYPE_VLLM_DECISION2 || type == COMMON_DECISION_TYPE_VLLM_D3) {
+    if (type == COMMON_DECISION_TYPE_VLLM_DECISION2 || type == COMMON_DECISION_TYPE_VLLM_D3 || is_laya_multimodal()) {
         return decision_confidence_entropy(probs);
     }
     // lfm3-d1: the probability of the answer (d1 api.py)
@@ -1710,23 +2034,120 @@ double server_decision_context::get_decision_confidence(server_decision_question
         case SERVER_DECISION_QUESTION_CHOICE: return decision_confidence_choice(probs);
         case SERVER_DECISION_QUESTION_SCORE:  return decision_confidence_score(probs);
         case SERVER_DECISION_QUESTION_NOUL:   break;
+        case SERVER_DECISION_QUESTION_BOX:    break;
     }
     throw std::runtime_error("no confidence for this question type");
 }
 
-json server_decision_context::format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores, bool has_media) const {
+static double decision_sigmoid(double x) {
+    return 1.0 / (1.0 + std::exp(-x));
+}
+
+static json decision_laya_box(const std::vector<float> & raw) {
+    if (raw.size() != 5 || !std::all_of(raw.begin(), raw.end(), [](float x) { return std::isfinite(x); })) {
+        throw std::runtime_error("invalid Laya Box result");
+    }
+    const double x0 = decision_sigmoid(raw[0]);
+    const double y0 = decision_sigmoid(raw[1]);
+    const double x1 = decision_sigmoid(raw[2]);
+    const double y1 = decision_sigmoid(raw[3]);
+    const double left   = std::min({x0, x1, 1.0 - 2e-6});
+    const double top    = std::min({y0, y1, 1.0 - 2e-6});
+    const double right  = std::max({x0, x1, left + 1e-6});
+    const double bottom = std::max({y0, y1, top + 1e-6});
+    return {{"type", "box"}, {"box", {{"top", top}, {"bottom", bottom}, {"left", left}, {"right", right}}},
+            {"confidence", decision_sigmoid(raw[4])}};
+}
+
+static void decision_laya_ordinal(std::vector<double> & probs, const json & profile) {
+    const std::string kind = profile.at("kind");
+    if (kind == "identity" || kind == "temperature") {
+        return;
+    }
+    const auto & parameters = profile.at("parameters");
+    const auto & prior = profile.at("prior");
+    if ((kind != "mix" && kind != "location") || !parameters.is_array() || parameters.size() != 5 ||
+        !prior.is_array() || prior.size() != probs.size()) {
+        throw std::runtime_error("invalid Laya ordinal calibration");
+    }
+    const double offset = parameters.at(1).get<double>();
+    const double gain = std::exp(std::clamp(parameters.at(2).get<double>(), -5.0, 5.0));
+    const double concentration = std::exp(std::clamp(parameters.at(3).get<double>(), -5.0, 7.0));
+    const double strength = decision_sigmoid(parameters.at(4).get<double>());
+    std::vector<double> prediction(probs.size(), 0.0);
+    auto add_profile = [&](double level, double weight) {
+        const double center = gain * level + offset;
+        const double nearest = std::clamp(std::round(center), 0.0, (double) probs.size() - 1);
+        std::vector<double> channel(probs.size());
+        double sum = 0.0;
+        for (size_t j = 0; j < probs.size(); j++) {
+            channel[j] = std::exp(-concentration * (j - nearest) * (j + nearest - 2.0 * center));
+            sum += channel[j];
+        }
+        for (size_t j = 0; j < probs.size(); j++) {
+            prediction[j] += weight * channel[j] / sum;
+        }
+    };
+    if (kind == "mix") {
+        for (size_t j = 0; j < probs.size(); j++) {
+            add_profile(j, probs[j]);
+        }
+    } else {
+        double level = 0.0;
+        for (size_t j = 0; j < probs.size(); j++) {
+            level += j * probs[j];
+        }
+        add_profile(level, 1.0);
+    }
+    for (size_t j = 0; j < probs.size(); j++) {
+        probs[j] = strength * prediction[j] + (1.0 - strength) * prior.at(j).get<double>();
+    }
+}
+
+json server_decision_context::format_answer(
+        const server_decision_question & question, const std::vector<std::vector<float>> & scores, const std::string & modality) const {
     const size_t n = n_outputs(question);
     if (scores.size() != n_variants(question)) {
         throw std::runtime_error("decision result does not match the number of variants");
     }
+    if (question.type == SERVER_DECISION_QUESTION_BOX) {
+        return decision_laya_box(scores.front());
+    }
 
     // softmax over the outputs of each variant, then the average of the variants
     // lfm2-d1-omni: image and audio answers are not calibrated
-    float temperature = has_media && type == COMMON_DECISION_TYPE_LFM2_D1_OMNI ? 1.0f : get_temperature(question);
+    const bool has_media = modality != "text";
+    double temperature = has_media && type == COMMON_DECISION_TYPE_LFM2_D1_OMNI ? 1.0 : get_temperature(question);
     // a model can have its own temperature for requests with media
     const auto it_image = temperatures.find("image");
     if (has_media && it_image != temperatures.end()) {
         temperature = it_image->second;
+    }
+    json ordinal_model;
+    bool calibrated = false;
+    if (is_laya_multimodal()) {
+        const auto & profiles = laya_config.at("modality_calibration");
+        const auto & profile = profiles.contains(modality) ? profiles.at(modality) : laya_config;
+        const auto & temperatures_by_type = profile.contains("temperature") ? profile.at("temperature") : laya_config.at("temperature");
+        temperature = temperatures_by_type.at(question.type).get<double>();
+        const auto & buckets = profile.contains("temperature_by_options") ? profile.at("temperature_by_options") : laya_config.at("temperature_by_options");
+        const std::string bucket = std::string(decision_question_type_name(question.type)) + ":" +
+            (n <= 2 ? "2" : n <= 5 ? "3-5" : n <= 10 ? "6-10" : "11+");
+        temperature = buckets.value(bucket, temperature);
+        if (profiles.contains(modality) && profile.contains("fitted_types")) {
+            const auto & types = profile.at("fitted_types");
+            calibrated = std::find(types.begin(), types.end(), json(question.type)) != types.end();
+        }
+        if (question.type == SERVER_DECISION_QUESTION_SCORE && laya_config.contains("ordinal_calibration") &&
+            !laya_config.at("ordinal_calibration").empty()) {
+            const auto & models = laya_config.at("ordinal_calibration").at("models");
+            ordinal_model = models.value(modality + ":" + std::to_string(n), json());
+            calibrated = !ordinal_model.is_null() && ordinal_model.at("kind") != "identity";
+            temperature = calibrated ? std::exp(std::clamp(ordinal_model.at("parameters").at(0).get<double>(), -5.0, 5.0)) : 1.0;
+        }
+        if (!std::isfinite(temperature) || temperature <= 0.0) {
+            throw std::runtime_error("invalid Laya decision temperature");
+        }
     }
     std::vector<double> probs(n, 0.0);
     for (size_t v = 0; v < scores.size(); v++) {
@@ -1739,6 +2160,11 @@ json server_decision_context::format_answer(const server_decision_question & que
             throw std::runtime_error("the model could not evaluate the decision");
         }
         std::vector<double> logits(s.begin(), s.end());
+        if (is_laya_multimodal() && !laya_candidate && laya_softcap > 0.0f) {
+            for (double & logit : logits) {
+                logit = laya_softcap * std::tanh(logit / laya_softcap);
+            }
+        }
         if (question.type == SERVER_DECISION_QUESTION_SCORE && score_bias.count(n) > 0) {
             for (size_t i = 0; i < n; i++) {
                 logits[i] += score_bias.at(n)[i];
@@ -1753,13 +2179,27 @@ json server_decision_context::format_answer(const server_decision_question & que
         }
         for (size_t i = 0; i < n; i++) {
             // the second variant is in the reverse order
-            probs[v == 0 ? i : n - 1 - i] += p[i] / sum / scores.size();
+            const size_t idx = question.option_order.empty() ? (v == 0 ? i : n - 1 - i) : question.option_order[i];
+            probs[idx] += p[i] / sum / scores.size();
         }
+    }
+    if (!ordinal_model.is_null()) {
+        decision_laya_ordinal(probs, ordinal_model);
     }
 
     json answer = json{{"type", decision_question_type_name(question.type)}};
+    if (is_laya_multimodal()) {
+        if (!std::all_of(probs.begin(), probs.end(), [](double p) { return std::isfinite(p); })) {
+            throw std::runtime_error("nonfinite Laya decision probabilities");
+        }
+        answer["calibrated"] = calibrated;
+        answer["answer_confidence"] = *std::max_element(probs.begin(), probs.end());
+    }
 
     if (question.type == SERVER_DECISION_QUESTION_NOUL) {
+        if (is_laya_multimodal()) {
+            answer["confidence"] = answer.at("answer_confidence");
+        }
         if (type == COMMON_DECISION_TYPE_LEV) {
             double expected = 0.0;
             for (size_t i = 0; i < n; i++) {
@@ -1783,7 +2223,8 @@ json server_decision_context::format_answer(const server_decision_question & que
 
     if (question.type == SERVER_DECISION_QUESTION_CHOICE) {
         const size_t best = std::max_element(probs.begin(), probs.end()) - probs.begin();
-        answer["choice"]        = question.options[best].key;
+        const auto & opt = question.options[best];
+        answer["choice"]        = opt.label.is_null() ? json(opt.key) : opt.label;
         answer["probabilities"] = probabilities;
         answer["confidence"]    = get_decision_confidence(question.type, probs);
     } else {
@@ -1792,7 +2233,8 @@ json server_decision_context::format_answer(const server_decision_question & que
         for (size_t i = 0; i < n; i++) {
             expected += i * probs[i];
             const json & description = question.options[i].description;
-            legend[question.options[i].key] = canonical_legend && !description.is_string() ? json(decision_sort_keys(description).dump()) : description;
+            legend[question.options[i].key] = is_laya_multimodal() ? json(decision_laya_text(description)) :
+                canonical_legend && !description.is_string() ? json(decision_sort_keys(description).dump()) : description;
         }
         // lfm3-d1: the median level, the first whose cumulative probability reaches one half (d1 api.py)
         if (is_lfm3_d1()) {

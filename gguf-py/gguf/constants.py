@@ -1120,6 +1120,10 @@ class MODEL_TENSOR(IntEnum):
     DECISION_QUERY                = auto()
     DECISION_OPTION_MLP           = auto()
     DECISION_QUERY_MLP            = auto()
+    DECISION_READOUT              = auto()
+    DECISION_BOX_NORM             = auto()
+    DECISION_BOX_HIDDEN           = auto()
+    DECISION_BOX_OUTPUT           = auto()
     CONV1D               = auto()
     CONVNEXT_DW          = auto()
     CONVNEXT_NORM        = auto()
@@ -2134,6 +2138,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DECISION_QUERY:                "decision.query",
     MODEL_TENSOR.DECISION_OPTION_MLP:           "decision.option_mlp",
     MODEL_TENSOR.DECISION_QUERY_MLP:            "decision.query_mlp",
+    MODEL_TENSOR.DECISION_READOUT:              "decision.readout",
+    MODEL_TENSOR.DECISION_BOX_NORM:             "decision.box_norm",
+    MODEL_TENSOR.DECISION_BOX_HIDDEN:           "decision.box_hidden",
+    MODEL_TENSOR.DECISION_BOX_OUTPUT:           "decision.box_output",
     MODEL_TENSOR.CONV1D:                    "conv1d",
     MODEL_TENSOR.CONVNEXT_DW:               "convnext.{bid}.dw",
     MODEL_TENSOR.CONVNEXT_NORM:             "convnext.{bid}.norm",
@@ -7454,6 +7462,7 @@ class GGUFValueType(IntEnum):
 
 
 class DecisionType:
+    LAYA_MULTIMODAL = "laya-multimodal"
     LAYA    = "laya"     # head blocks + scorer on the hidden state of one marker token per option
     OPENJEV = "openjev"  # logits of one label token per option
     LEV     = "lev"      # same as openjev, noul is read from a rating scale

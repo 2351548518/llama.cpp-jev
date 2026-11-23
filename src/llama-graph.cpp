@@ -4446,6 +4446,21 @@ void llm_graph_context::build_dense_out(
 }
 
 
+void llm_graph_context::build_decision_readout() const {
+    ggml_tensor * hidden = res->t_embd;
+    ggml_tensor * scores = build_lora_mm(model.decision_readout, hidden);
+    if (model.decision_box_hidden) {
+        ggml_tensor * box = ggml_norm(ctx0, hidden, 1e-5f);
+        box = ggml_add(ctx0, ggml_mul(ctx0, box, model.decision_box_norm), model.decision_box_norm_b);
+        box = ggml_add(ctx0, build_lora_mm(model.decision_box_hidden, box), model.decision_box_hidden_b);
+        box = ggml_gelu_erf(ctx0, box);
+        box = ggml_add(ctx0, build_lora_mm(model.decision_box_output, box), model.decision_box_output_b);
+        scores = ggml_concat(ctx0, scores, box, 0);
+    }
+    res->t_embd = scores;
+    res->t_logits = nullptr;
+}
+
 void llm_graph_context::build_pooling(
         ggml_tensor * cls,
         ggml_tensor * cls_b,

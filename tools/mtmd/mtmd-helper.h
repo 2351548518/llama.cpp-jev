@@ -49,6 +49,11 @@ struct mtmd_helper_video_decoder {
     const float * (*read_audio)(void * state, int sample_rate, size_t * n_samples);
     void (*close)(void * state);
     void * user_data;
+    // optional: return at most max_samples, so callers can check the duration before reading a long track
+    const float * (*read_audio_bounded)(void * state, int sample_rate, size_t max_samples, size_t * n_samples);
+    // optional: read_frame() returns each distinct requested source frame in order
+    // indices are sorted and may repeat. Return false to fall back to start().
+    bool (*start_selected)(void * state, uint32_t width, uint32_t height, const int32_t * indices, size_t n_indices);
 };
 
 struct mtmd_helper_video_init_params {
@@ -57,6 +62,9 @@ struct mtmd_helper_video_init_params {
     int64_t timestamp_interval_ms; // interval for adding timestamp as text chunk (example: "[10m50.5s]"); <= 0 means no timestamp, defaulted to 5000ms
     bool no_soundtrack;          // frames only, also for models that hear the soundtrack of a video (LFM3-Omni)
     const struct mtmd_helper_video_decoder * decoder; // NULL means ffmpeg (requires MTMD_VIDEO)
+    int32_t center_frames;       // evenly spaced frame centers; 0 uses the model's recommended sampling
+    enum mtmd_video_template prompt_template; // DEFAULT keeps the model's template
+    float max_full_soundtrack_seconds; // when positive, append the full soundtrack with this duration limit
     // TODO @ngxson : allow "placeholder" bitmap output for counting tokens
 };
 
@@ -534,8 +542,10 @@ struct mtmd_helper_video_seq {
     int32_t     out_height    = 0;
 
     std::vector<int32_t> frame_indices;
+    std::vector<double> frame_times;
     size_t      next_index = 0;
     int32_t     src_frame  = 0;
+    bool        frames_selected = false;
     double      src_fps    = 0.0;
 
     std::vector<uint8_t> frame_buf;
@@ -547,6 +557,8 @@ struct mtmd_helper_video_seq {
     std::vector<float> soundtrack;
     mtmd_bitmap *      pending_audio = nullptr;
     bool          start_emitted = false;
+    bool          end_emitted = false;
+    bool          append_full_soundtrack = false;
 
     mtmd_helper_video_seq() = default;
     mtmd_helper_video_seq(const mtmd_helper_video_seq &) = delete;

@@ -19,8 +19,8 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
     // starting at pos_eval - n_swa + 1 is enough, while a state without SWA must end before pos_eval
     const llama_pos pos_eval = res.pos_next - (has_new_tokens ? 0 : 1);
 
-    // a state or a checkpoint is useful when its pos_min is below this threshold
-    const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+    // A SWA state starting at zero covers the whole window near the start of the prompt.
+    const auto pos_min_thold = n_swa > 0 ? std::max(1, pos_eval - n_swa + 2) : std::max(0, pos_eval);
 
     if (pos_min < pos_min_thold) {
         return res;

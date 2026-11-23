@@ -1858,6 +1858,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // call the per-model loading function
         load_arch_tensors(ml);
 
+        const auto decision_readout_name = tn(LLM_TENSOR_DECISION_READOUT, "weight");
+        if (const auto * meta = ml.get_tensor_meta(decision_readout_name.str().c_str())) {
+            const int64_t n_in = hparams.n_embd;
+            const int64_t n_scores = meta->ne[1];
+            const auto box_hidden_name = tn(LLM_TENSOR_DECISION_BOX_HIDDEN, "weight");
+            const auto * box_meta = ml.get_tensor_meta(box_hidden_name.str().c_str());
+            if (n_scores < 2 || n_scores > 2048 || n_scores + (box_meta ? 5 : 0) != hparams.n_embd_out()) {
+                throw std::runtime_error("invalid decision readout dimensions");
+            }
+            decision_readout = create_tensor(decision_readout_name, {n_in, n_scores}, 0);
+            if (box_meta) {
+                const int64_t n_hidden = box_meta->ne[1];
+                if (n_hidden < 1 || n_hidden > 4096) {
+                    throw std::runtime_error("invalid box readout dimensions");
+                }
+                decision_box_norm     = create_tensor(tn(LLM_TENSOR_DECISION_BOX_NORM,   "weight"), {n_in}, 0);
+                decision_box_norm_b   = create_tensor(tn(LLM_TENSOR_DECISION_BOX_NORM,   "bias"),   {n_in}, 0);
+                decision_box_hidden   = create_tensor(box_hidden_name,                           {n_in, n_hidden}, 0);
+                decision_box_hidden_b = create_tensor(tn(LLM_TENSOR_DECISION_BOX_HIDDEN, "bias"),   {n_hidden}, 0);
+                decision_box_output   = create_tensor(tn(LLM_TENSOR_DECISION_BOX_OUTPUT, "weight"), {n_hidden, 5}, 0);
+                decision_box_output_b = create_tensor(tn(LLM_TENSOR_DECISION_BOX_OUTPUT, "bias"),   {5}, 0);
+            }
+        }
+
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
@@ -3635,6 +3659,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+
+    if (decision_readout) {
+        llm->build_decision_readout();
+    }
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);

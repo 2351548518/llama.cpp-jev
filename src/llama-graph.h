@@ -1552,6 +1552,8 @@ struct llm_graph_context {
     // pooling
     //
 
+    void build_decision_readout() const;
+
     void build_pooling(
             ggml_tensor * cls,
             ggml_tensor * cls_b,

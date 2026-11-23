@@ -2170,7 +2170,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     const int64_t n_vocab = vocab.n_tokens();
 
     // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    const bool output_all   = cparams.embeddings && model.decision_readout == nullptr;
     // non-causal attention needs the whole sequence in one ubatch
     const bool embd_all     = output_all || !cparams.causal_attn;
     const bool has_samplers = !sampling.samplers.empty();

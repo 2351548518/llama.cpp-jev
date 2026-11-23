@@ -64,6 +64,9 @@ enum mtmd_video_template {
     MTMD_VIDEO_TEMPLATE_LFM3,      // "<X.X seconds>" before every group of 2 frames
     MTMD_VIDEO_TEMPLATE_LFM3_OMNI, // same as LFM3, then the soundtrack of each group, as an audio bitmap after its frames
     MTMD_VIDEO_TEMPLATE_QWEN3VL,   // "<X.X seconds>" before every group of 2 frames, no markers around the whole video
+    MTMD_VIDEO_TEMPLATE_QWEN3VL_WRAPPED, // same groups, with the chat template's outer vision markers
+    MTMD_VIDEO_TEMPLATE_GEMMA4,    // "MM:SS " before each frame
+    MTMD_VIDEO_TEMPLATE_TIMED_IMAGES, // "Time X.XXX seconds:" before each independent image
 };
 
 // opaque types
@@ -133,6 +136,10 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // Optional video processor settings for a trained checkpoint.
+    int32_t video_frames;
+    int32_t video_max_tokens_per_frame;
 };
 
 MTMD_API const char * mtmd_default_marker(void);

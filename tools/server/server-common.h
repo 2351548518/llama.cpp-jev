@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -171,12 +172,13 @@ struct server_tokens {
     static constexpr size_t hash_block_size = 64;
 
     using prefix_hash = std::array<uint8_t, 32>; // SHA-256
+    using media_chunk_ptr = std::shared_ptr<const mtmd_input_chunk>;
 
 private: // disallow accessing these members directly, risking out-of-sync
 
     // map a **start** index in tokens to the image chunk
     // note: the order need to be in-sync with tokens
-    std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
+    std::map<size_t, media_chunk_ptr> map_idx_to_media;
 
     // list of tokens
     //   if the token is LLAMA_TOKEN_NULL, it indicates that this position is occupied by media chunk
@@ -226,11 +228,11 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
-    const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
+    const media_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
-    std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
+    std::pair<const media_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
 
     void push_back(llama_token tok);
 
@@ -241,8 +243,8 @@ public:
     // only use this if the chunk will never be encoded again (e.g. it is already in the KV cache)
     void push_back_placeholder(const mtmd_input_chunk * chunk);
 
-    // appends server tokens, updates the media map. copies media chunks.
-    void push_back(server_tokens & tokens);
+    // appends server tokens and shares the immutable media chunks
+    void push_back(const server_tokens & other);
 
     // for compatibility with context shift and prompt truncation
     void insert(const llama_tokens & inp_tokens);
@@ -338,7 +340,27 @@ server_tokens process_mtmd_prompt(
                                         const std::string & prompt,
                                         const std::vector<raw_buffer> & files,
                                          const mtmd_helper_init_opt & init_opt,
-                                          bool is_placeholder = false);
+                                          bool is_placeholder = false,
+                                          bool add_special = true);
+
+// Tokenize prompts with the same media in one request. The prefix through the last media
+// marker can be reused when its text and special-token settings match.
+struct server_mtmd_input {
+    server_mtmd_input(mtmd_context * ctx, const llama_vocab * vocab, const std::vector<raw_buffer> & files,
+                      const mtmd_helper_init_opt & options);
+
+    server_tokens tokenize(const std::string & prompt, bool add_special = true);
+
+    mtmd_context * const ctx;
+    const std::vector<raw_buffer> & files;
+    const mtmd_helper_init_opt options;
+
+private:
+    const llama_vocab * const vocab;
+    std::string prefix;
+    server_tokens prefix_tokens;
+    bool prefix_add_special = false;
+};
 
 // decode one media url (http/file/data-uri) into out_files; throws on failure
 void handle_media(std::vector<raw_buffer> & out_files, const std::string & url, const std::string & media_path, bool allow_private_urls);

@@ -2057,6 +2057,22 @@ curl http://127.0.0.1:9931/v1/systemone \
 
 An invalid request returns the error `400`. A model that is not a decision model returns the error `501`. A request with images returns the error `501` if the model does not support image input, or if no multimodal projector is loaded.
 
+#### Laya native multimodal checkpoints
+
+Export a `MultimodalAgent.save()` directory with its saved processor and base model. The exporter uses the Transformers conversion environment and merges standard LoRA weights during export. It writes the model and media encoders together into a new directory. Use `--base` if the saved base model path moved.
+
+```sh
+python convert_laya_to_gguf.py /path/to/laya/checkpoint --out-dir /path/to/laya-gguf
+llama-server -m /path/to/laya-gguf/model.gguf --mmproj /path/to/laya-gguf/mmproj.gguf \
+    -ngl 999 -c 8192 -b 1024 -ub 1024 -np 1
+```
+
+Qwen3.5 checkpoints read text, images, and video frames. Gemma 4 E2B also reads native audio. Qwen2.5-Omni checkpoints with a letter head read video as timestamped images and support native audio. Audio-capable checkpoints can use the video soundtrack when `use_audio_in_video` is enabled in the checkpoint. Video uses the checkpoint's frame count and needs `ffmpeg` and `ffprobe` on the server. Submit media as data URLs in `files`. A media-only request may omit `state`. Set the context size for the processed media and text. For a candidate head, set `--batch-size` to fit the suffix from the first candidate marker through the end of its prompt.
+
+The decision head preserves the checkpoint's option ordering and modality calibration. `choice` accepts an object or an array of scalar labels. Candidate checkpoints allow up to 256 options within the context and batch budgets. Each discrete question accepts an `option_order` permutation. `noul` accepts custom `labels` for `false` and `true` and returns P(true) in canonical order.
+
+With a trained single-box head, a question such as `{"type":"box","instructions":"the red mug"}` takes exactly one still image. Its answer contains `box` with normalized `top`, `bottom`, `left` and `right` edges, and a `confidence` estimating localization quality. A separate `noul` question can ask whether the target is present.
+
 ## Server tools
 
 The server exposes a REST API under `/tools` that allows Llama Chat to call server tools. This endpoint is intended to be used internally by Llama Chat and subject to change or to be removed in the future.

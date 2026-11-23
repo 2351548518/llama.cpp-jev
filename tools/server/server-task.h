@@ -214,6 +214,9 @@ struct server_task {
         int32_t                  column = 0;
         // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
         int32_t                  pointer = -1;
+        int32_t                  pointer_dim = 0; // cosine readout when set
+        float                    pointer_scale = 1.0f;
+        int32_t                  n_values = 0; // slice at the last prompt token, starting at column
         // if set, the prompt must be the only sequence of its batch
         bool                     no_batching = false;
 
@@ -264,7 +267,7 @@ struct server_task {
             case SERVER_TASK_TYPE_RERANK:
                 return true;
             case SERVER_TASK_TYPE_DECISION:
-                return !decision.markers.empty() || !decision.order.empty() || decision.pooled;
+                return !decision.markers.empty() || !decision.order.empty() || decision.pooled || decision.n_values > 0;
             default:
                 return false;
         }

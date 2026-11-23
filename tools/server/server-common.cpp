@@ -231,6 +231,7 @@ std::vector<std::string> server_model_output_modalities(common_decision_type dec
         case COMMON_DECISION_TYPE_KEV:
         case COMMON_DECISION_TYPE_NIMBLE:
         case COMMON_DECISION_TYPE_LAYA:
+        case COMMON_DECISION_TYPE_LAYA_MULTIMODAL:
         case COMMON_DECISION_TYPE_CLEF:
         case COMMON_DECISION_TYPE_PPLX_DECIDER:
         case COMMON_DECISION_TYPE_VLLM_DECISION2:
@@ -622,7 +623,7 @@ std::string server_tokens::str() const {
     return oss.str();
 }
 
-const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
+const server_tokens::media_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     auto it = map_idx_to_media.find(idx);
     if (it != map_idx_to_media.end()) {
         return it->second;
@@ -630,7 +631,7 @@ const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     throw std::runtime_error("Chunk not found");
 }
 
-std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
+std::pair<const server_tokens::media_chunk_ptr *, size_t> server_tokens::find_next_media_chunk(size_t idx) const {
     auto it = map_idx_to_media.upper_bound(idx);
     if (it != map_idx_to_media.end()) {
         return { &it->second, it->first };
@@ -687,21 +688,14 @@ void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
     }
 }
 
-void server_tokens::push_back(server_tokens & tokens) {
-    size_t start_idx = size();
-    for (size_t i = 0; i < tokens.size(); i++) {
-        push_back(tokens[i]);
+void server_tokens::push_back(const server_tokens & other) {
+    GGML_ASSERT(this != &other);
+    GGML_ASSERT(!other.has_mtmd || has_mtmd);
+    const size_t start_idx = size();
+    for (const auto & [idx, chunk] : other.map_idx_to_media) {
+        map_idx_to_media.emplace(start_idx + idx, chunk);
     }
-    if (tokens.has_mtmd) {
-        // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
-        // We could also just check, but this will prevent silently dropping MTMD data.
-        GGML_ASSERT(has_mtmd);
-        for (auto it = tokens.map_idx_to_media.begin(); it != tokens.map_idx_to_media.end(); ) {
-            auto * chunk = tokens.map_idx_to_media[it->first].get();
-            mtmd::input_chunk_ptr new_chunk(mtmd_input_chunk_copy(chunk));
-            map_idx_to_media[start_idx + it->first] = std::move(new_chunk);
-        }
-    }
+    insert(other.tokens);
 }
 
 void server_tokens::insert(const llama_tokens & inp_tokens) {
@@ -1009,11 +1003,7 @@ server_tokens server_tokens::clone() const {
     res.has_mtmd = has_mtmd;
     res.tokens   = tokens;
     res.hashes   = hashes;
-    for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
-        size_t idx = it->first;
-        const mtmd::input_chunk_ptr & chunk = it->second;
-        res.map_idx_to_media[idx] = mtmd::input_chunk_ptr(mtmd_input_chunk_copy(chunk.get()));
-    }
+    res.map_idx_to_media = map_idx_to_media;
     return res;
 }
 
@@ -1149,7 +1139,8 @@ server_tokens process_mtmd_prompt(
         const std::string & prompt,
         const std::vector<raw_buffer> & files,
         const mtmd_helper_init_opt & init_opt,
-        bool is_placeholder) {
+        bool is_placeholder,
+        bool add_special) {
     // these will be freed upon going out of scope
     mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
@@ -1169,7 +1160,7 @@ server_tokens process_mtmd_prompt(
     mtmd_input_text inp_txt = {
         prompt.data(),
         prompt.size(),
-        /* add_special */   true,
+        /* add_special */   add_special,
         /* parse_special */ true,
     };
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
@@ -1183,6 +1174,43 @@ server_tokens process_mtmd_prompt(
         throw std::runtime_error("Failed to tokenize prompt");
     }
     auto result = server_tokens(chunks, true);
+    return result;
+}
+
+server_mtmd_input::server_mtmd_input(mtmd_context * ctx, const llama_vocab * vocab, const std::vector<raw_buffer> & files,
+                                     const mtmd_helper_init_opt & options)
+    : ctx(ctx), files(files), options(options), vocab(vocab) {}
+
+server_tokens server_mtmd_input::tokenize(const std::string & prompt, bool add_special) {
+    if (files.empty()) {
+        return server_tokens(common_tokenize(vocab, prompt, add_special, true), false);
+    }
+
+    const std::string_view marker = mtmd_get_marker(ctx);
+    const size_t last_marker = prompt.rfind(marker);
+    if (last_marker == std::string::npos) {
+        return process_mtmd_prompt(ctx, prompt, files, options, false, add_special);
+    }
+    const size_t end = last_marker + marker.size();
+    const std::string_view head(prompt.data(), end);
+    const bool add_eos = add_special && llama_vocab_get_add_eos(vocab);
+    if (head != prefix || add_special != prefix_add_special) {
+        std::string new_prefix(head);
+        auto tokens = process_mtmd_prompt(ctx, new_prefix, files, options, false, add_special);
+        if (add_eos) {
+            tokens.keep_first(tokens.size() - 1);
+        }
+        prefix = std::move(new_prefix);
+        prefix_tokens = std::move(tokens);
+        prefix_add_special = add_special;
+    }
+
+    // The tokenizer already splits the text at each media marker.
+    auto result = prefix_tokens.clone();
+    result.insert(common_tokenize(vocab, prompt.substr(end), false, true));
+    if (add_eos) {
+        result.push_back(llama_vocab_eos(vocab));
+    }
     return result;
 }
 

@@ -606,6 +606,8 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* video_frames */ 0,
+        /* video_max_tokens_per_frame */ 0,
     };
     return params;
 }
@@ -891,6 +893,8 @@ struct mtmd_context {
 
     // batching
     int32_t batch_max_tokens;
+    int32_t video_frames;
+    int32_t video_max_tokens_per_frame;
 
     // TODO @ngxson : add timings
 
@@ -904,7 +908,9 @@ struct mtmd_context {
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
         text_model      (text_model),
-        batch_max_tokens(ctx_params.batch_max_tokens)
+        batch_max_tokens(ctx_params.batch_max_tokens),
+        video_frames(ctx_params.video_frames),
+        video_max_tokens_per_frame(ctx_params.video_max_tokens_per_frame)
     {
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
@@ -1126,8 +1132,10 @@ struct mtmd_context {
             case PROJECTOR_TYPE_MAGEVL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
-                    img_beg = "<|vision_start|>";
-                    img_end = "<|vision_end|>";
+                    const bool omni = proj == PROJECTOR_TYPE_QWEN25VL && models.a &&
+                        models.a->proj_type == PROJECTOR_TYPE_QWEN2A && models.a->hparams.audio_chunk_size > 0;
+                    img_beg = omni ? "<|vision_bos|>" : "<|vision_start|>";
+                    img_end = omni ? "<|vision_eos|>" : "<|vision_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
                 } break;
             case PROJECTOR_TYPE_MINIMAX_M3:
@@ -1376,7 +1384,11 @@ struct mtmd_context {
                     // <|image> ... (image embeddings) ... <image|>
                     img_beg = "<|image>";
                     img_end = "<image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
+                    if (video_frames > 0) {
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_gemma4>(models.v.get());
+                    } else {
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(models.v.get());
+                    }
                 } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR:
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
@@ -4701,7 +4713,7 @@ int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {
 
 mtmd_video_config mtmd_video_config_init(mtmd_video_template tmpl, const mtmd_image_preprocessor * preproc,
                                          int32_t src_width, int32_t src_height,
-                                         int32_t src_n_frames, float src_fps) {
+                                         int32_t src_n_frames, float src_fps, int32_t fixed_frames, int32_t max_tokens_per_frame) {
     mtmd_video_config cfg{tmpl, 0.0f, 0, 0, 0};
     if (tmpl == MTMD_VIDEO_TEMPLATE_DEFAULT) {
         return cfg;
@@ -4710,17 +4722,20 @@ mtmd_video_config mtmd_video_config_init(mtmd_video_template tmpl, const mtmd_im
     // matches Qwen3VLVideoProcessor and Lfm3VlVideoProcessor: 2 fps sampling with a [4, 768] frame clamp
     // LFM3-Omni samples at most 384 frames and hears the soundtrack
     cfg.fps = 2.0f;
-    if (src_n_frames <= 0 || src_fps <= 0.0f) {
+    if (fixed_frames <= 0 && (src_n_frames <= 0 || src_fps <= 0.0f)) {
         return cfg;
     }
 
-    int32_t n = (int32_t)((double) src_n_frames / src_fps * cfg.fps);
-    n = std::clamp(n, 4, tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI ? 384 : 768);
-    n = std::min(n, src_n_frames);
+    int32_t n = fixed_frames;
+    if (n <= 0) {
+        n = (int32_t)((double) src_n_frames / src_fps * cfg.fps);
+        n = std::clamp(n, 4, tmpl == MTMD_VIDEO_TEMPLATE_LFM3_OMNI ? 384 : 768);
+        n = std::min(n, src_n_frames);
+    }
     cfg.n_frames = n;
 
     mtmd_image_size size;
-    if (preproc && preproc->get_video_frame_size(n, src_width, src_height, size)) {
+    if (preproc && preproc->get_video_frame_size(n, src_width, src_height, size, max_tokens_per_frame)) {
         cfg.frame_width  = size.width;
         cfg.frame_height = size.height;
     }
@@ -4741,7 +4756,8 @@ mtmd_video_config mtmd_get_video_config(const mtmd_context * ctx,
         default:
             break;
     }
-    return mtmd_video_config_init(tmpl, ctx->image_preproc.get(), src_width, src_height, src_n_frames, src_fps);
+    return mtmd_video_config_init(tmpl, ctx->image_preproc.get(), src_width, src_height, src_n_frames, src_fps,
+                                  ctx->video_frames, ctx->video_max_tokens_per_frame);
 }
 
 const char * mtmd_get_marker(const mtmd_context * ctx) {

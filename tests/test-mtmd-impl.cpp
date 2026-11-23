@@ -133,6 +133,11 @@ MAKE_TEST(test_image_preprocessor_qwen3vl_video) {
         t.assert_equal(name + " width", expected.width, actual.width);
         t.assert_equal(name + " height", expected.height, actual.height);
     }
+
+    const auto config = mtmd_video_config_init(MTMD_VIDEO_TEMPLATE_QWEN3VL_WRAPPED, &preproc, 1920, 1080, 120, 24.0f, 4, 768);
+    t.assert_equal("fixed frame count", 4, config.n_frames);
+    t.assert_equal("capped frame width", 1152, config.frame_width);
+    t.assert_equal("capped frame height", 640, config.frame_height);
 }
 
 static std::string image_size_to_str(const mtmd_image_size & size) {
@@ -474,6 +479,21 @@ static std::string video_sequence_to_str(testing & t, mtmd_helper_video_seq & vi
     }
     t.assert_equal("end of stream", -1, ret);
     return out;
+}
+
+MAKE_TEST(test_video_sequence_selected_frames) {
+    const mtmd_helper_video_stream_info src = {64, 64, 8.0f, 16, 2.0f};
+    const mtmd_video_config cfg = {MTMD_VIDEO_TEMPLATE_DEFAULT, 0.0f, 0, 0, 0};
+    test_video_source video(3);
+    video.configure(cfg, src, 0.0f);
+    video.frame_indices = {2, 2, 5, 12, 12};
+    video.frames_selected = true;
+    video.src_alive = true;
+    video.timestamp_interval_ms = 0;
+
+    t.assert_equal("selected frames and repeats", std::string("Video:[0][0][1][2][2]"), video_sequence_to_str(t, video));
+    t.assert_equal("frames requested from decoder", 3, video.n_read);
+    t.assert_equal("frames skipped by helper", 0, video.n_skipped);
 }
 
 MAKE_TEST(test_video_sequence_qwen3vl) {

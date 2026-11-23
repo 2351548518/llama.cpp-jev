@@ -16,11 +16,13 @@ enum server_decision_question_type {
     SERVER_DECISION_QUESTION_CHOICE,
     SERVER_DECISION_QUESTION_SCORE,
     SERVER_DECISION_QUESTION_NOUL,
+    SERVER_DECISION_QUESTION_BOX,
 };
 
 struct server_decision_option {
     std::string key;
     json description; // null if not provided
+    json label = nullptr; // typed Laya choice label from a criteria array
 };
 
 struct server_decision_question {
@@ -28,6 +30,8 @@ struct server_decision_question {
     server_decision_question_type type;
     json instructions;
     std::vector<server_decision_option> options; // in the order of the model outputs
+    std::vector<size_t> option_order = {}; // presentation slot -> canonical option
+    std::vector<std::string> noul_labels = {};
 };
 
 struct server_decision_context {
@@ -40,6 +44,7 @@ struct server_decision_context {
     bool can_share_prompt() const {
         switch (type) {
             case COMMON_DECISION_TYPE_OPENJEV:
+            case COMMON_DECISION_TYPE_LAYA_MULTIMODAL:
             case COMMON_DECISION_TYPE_GRANITE_SWITCH:
             case COMMON_DECISION_TYPE_LEV:
             case COMMON_DECISION_TYPE_KEV:
@@ -63,10 +68,15 @@ struct server_decision_context {
         return type == COMMON_DECISION_TYPE_LFM3_D1 || type == COMMON_DECISION_TYPE_LFM3_D1_OMNI;
     }
 
+    bool is_laya_multimodal() const {
+        return type == COMMON_DECISION_TYPE_LAYA_MULTIMODAL;
+    }
+
     // true if the prompt of the model has a place for images
     bool can_use_images() const {
         switch (type) {
             case COMMON_DECISION_TYPE_OPENJEV:
+            case COMMON_DECISION_TYPE_LAYA_MULTIMODAL:
             case COMMON_DECISION_TYPE_CLEF:
             case COMMON_DECISION_TYPE_PPLX_DECIDER:
             case COMMON_DECISION_TYPE_VLLM_D3:
@@ -99,30 +109,27 @@ struct server_decision_context {
     // images come from "files" (alias "images") and from the image_url and input_audio parts of a state made of chat messages
     // an image can be an audio clip if the model supports it
     json parse_state(const json & body, std::vector<raw_buffer> & files) const;
+    std::string input_modality(const json & state, const std::vector<raw_buffer> & files, mtmd_context * mctx, const mtmd_helper_init_opt & opt) const;
+    void configure_media(mtmd_context_params & params) const;
+    void configure_media(mtmd_helper_init_opt & opt) const;
 
     // number of prompts that are evaluated to answer this question, each one shows the options in a different order
     size_t n_variants(const server_decision_question & question) const;
 
     // set the prompt of one variant of this question, and where to read its result
-    // mctx is only used if there are files
     void fill_task(
             const json & state,
             const std::vector<server_decision_question> & questions,
             const server_decision_question & question,
             size_t variant,
-            const std::vector<raw_buffer> & files,
-            mtmd_context * mctx,
-            const mtmd_helper_init_opt & init_opt,
+            server_mtmd_input & input,
             server_task & task) const;
 
     // set the prompt of all the questions, the result has the scores of all their options, in order
-    // mctx is only used if there are files
     void fill_task_joint(
             const json & state,
             const std::vector<server_decision_question> & questions,
-            const std::vector<raw_buffer> & files,
-            mtmd_context * mctx,
-            const mtmd_helper_init_opt & init_opt,
+            server_mtmd_input & input,
             server_task & task) const;
 
     // lfm3-d1: max questions per prompt, 0 if each question has its own prompt
@@ -132,13 +139,11 @@ struct server_decision_context {
     void fill_task_set(
             const json & state,
             const std::vector<server_decision_question> & questions,
-            const std::vector<raw_buffer> & files,
-            mtmd_context * mctx,
-            const mtmd_helper_init_opt & init_opt,
+            server_mtmd_input & input,
             server_task & task) const;
 
     // scores: the raw model outputs of each variant
-    json format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores, bool has_media = false) const;
+    json format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores, const std::string & modality = "text") const;
 
 private:
     const llama_vocab * vocab = nullptr;
@@ -164,6 +169,16 @@ private:
     size_t      max_head_tokens   = 0; // question + options
     size_t      max_option_tokens = 48;
 
+    json laya_config;
+    int32_t laya_projection_size = 0;
+    bool laya_candidate = false;
+    bool laya_box = false;
+    float laya_scale = 1.0f;
+    float laya_softcap = 0.0f;
+    mtmd_video_template laya_video_template = MTMD_VIDEO_TEMPLATE_DEFAULT;
+    int32_t laya_image_min_tokens = 0;
+    int32_t laya_image_max_tokens = 0;
+
     // H2O_LIGHTNING
     std::vector<std::string> quoted_spellings; // texts of the special tokens, quoted in the input, longest first
     std::string              quoted_first;     // the first bytes of these texts
@@ -188,14 +203,14 @@ private:
     // LFM3_D1: a zero-width space after the first character of each special token text (d1 prompt.py: plain)
     std::string d1_break(const std::string & text) const;
     void fill_task_laya(llama_tokens & tokens, const server_decision_question & question, server_task & task) const;
+    void fill_task_laya_multimodal(const json & state, const server_decision_question & question,
+            server_mtmd_input & input, server_task & task) const;
     void fill_task_d1omni(
             const json & state,
             const std::vector<server_decision_question> & questions,
             const server_decision_question & question,
             size_t variant,
-            const std::vector<raw_buffer> & files,
-            mtmd_context * mctx,
-            const mtmd_helper_init_opt & init_opt,
+            server_mtmd_input & input,
             server_task & task) const;
 
     float get_temperature(const server_decision_question & question) const;

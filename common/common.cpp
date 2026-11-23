@@ -1159,6 +1159,7 @@ static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NA
     { COMMON_DECISION_TYPE_KEV,            "kev"           },
     { COMMON_DECISION_TYPE_NIMBLE,         "nimble"        },
     { COMMON_DECISION_TYPE_LAYA,           "laya"          },
+    { COMMON_DECISION_TYPE_LAYA_MULTIMODAL, "laya-multimodal" },
     { COMMON_DECISION_TYPE_CLEF,           "clef"          },
     { COMMON_DECISION_TYPE_PPLX_DECIDER,   "pplx-decider"  },
     { COMMON_DECISION_TYPE_VLLM_DECISION2, "vllm-decision2" },
@@ -1299,7 +1300,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // minicpm-ocr-jev reads its class scores from the pooled output, the pooling type is the one of the GGUF
     if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF ||
         decision_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || decision_type == COMMON_DECISION_TYPE_VLLM_DECISION2 ||
-        decision_type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV) {
+        decision_type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV || decision_type == COMMON_DECISION_TYPE_LAYA_MULTIMODAL) {
         const auto pooling_type = decision_type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV ? LLAMA_POOLING_TYPE_UNSPECIFIED : LLAMA_POOLING_TYPE_NONE;
 
         params.embedding    = true;
@@ -1326,7 +1327,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
     // (server.cpp does this check for --embedding, but before the model is loaded)
-    if (cparams.embeddings && cparams.n_batch > cparams.n_ubatch) {
+    const bool sparse_decision_readout = decision_type == COMMON_DECISION_TYPE_LAYA_MULTIMODAL &&
+        cparams.attention_type != LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+    if (cparams.embeddings && !sparse_decision_readout && cparams.n_batch > cparams.n_ubatch) {
         LOG_WRN("embeddings enabled: setting n_batch = n_ubatch = %u\n", cparams.n_ubatch);
         cparams.n_batch = cparams.n_ubatch;
         params.n_batch  = params.n_ubatch;

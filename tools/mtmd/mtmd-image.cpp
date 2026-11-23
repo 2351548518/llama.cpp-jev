@@ -808,14 +808,44 @@ mtmd_image_size mtmd_image_preprocessor_dyn_size::get_target_size(const mtmd_hpa
 }
 
 mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const mtmd_image_u8 & img) const {
+    return resize_to(img, target_size(img.get_size()));
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::resize_to(const mtmd_image_u8 & img, const mtmd_image_size & size) const {
     mtmd_image_u8 resized_image;
-    img_tool::resize(img, resized_image, target_size(img.get_size()),
+    img_tool::resize(img, resized_image, size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,
                         hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
     return output;
+}
+
+mtmd_image_size mtmd_image_preprocessor_gemma4::fixed_budget_size(const mtmd_image_size & size, int n_tokens) const {
+    const int group = hparams.patch_size * hparams.n_merge;
+    const double scale = std::sqrt((double) n_tokens / ((double) size.width * size.height));
+    int width  = (int) std::floor(size.width  * scale);
+    int height = (int) std::floor(size.height * scale);
+    if (width == 0) {
+        width = 1;
+        height = std::min(n_tokens, size.height / size.width);
+    } else if (height == 0) {
+        height = 1;
+        width = std::min(n_tokens, size.width / size.height);
+    }
+    return {width * group, height * group};
+}
+
+mtmd_image_size mtmd_image_preprocessor_gemma4::target_size(const mtmd_image_size & size) const {
+    if (hparams.custom_image_min_tokens > 0 && hparams.custom_image_min_tokens == hparams.custom_image_max_tokens) {
+        return fixed_budget_size(size, hparams.custom_image_max_tokens);
+    }
+    return mtmd_image_preprocessor_dyn_size::target_size(size);
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_gemma4::preprocess_video_frame(const mtmd_image_u8 & img) const {
+    return resize_to(img, fixed_budget_size(img.get_size(), 70));
 }
 
 //
@@ -889,9 +919,16 @@ mtmd_image_size mtmd_image_preprocessor_qwen3vl::smart_resize(int width, int hei
     return {std::max(factor, w_bar), std::max(factor, h_bar)};
 }
 
-bool mtmd_image_preprocessor_qwen3vl::get_video_frame_size(int n_frames, int width, int height, mtmd_image_size & out) const {
+bool mtmd_image_preprocessor_qwen3vl::get_video_frame_size(int n_frames, int width, int height, mtmd_image_size & out, int max_tokens_per_frame) const {
     // Qwen3VLVideoProcessor (and Lfm3VlVideoProcessor) size: shortest_edge 4096, longest_edge 25165824, temporal_patch_size 2
-    out = smart_resize(width, height, hparams.patch_size * hparams.n_merge, 4096, 25165824, n_frames, 2);
+    const int factor = hparams.patch_size * hparams.n_merge;
+    const int min_pixels = 4096;
+    int max_pixels = 25165824;
+    if (max_tokens_per_frame > 0) {
+        const int64_t frame_cap = (int64_t) max_tokens_per_frame * factor * factor;
+        max_pixels = std::max<int64_t>(std::min<int64_t>(frame_cap, max_pixels / n_frames), min_pixels * 105 / 100) * n_frames;
+    }
+    out = smart_resize(width, height, factor, min_pixels, max_pixels, n_frames, 2);
     return true;
 }
 
@@ -902,17 +939,6 @@ mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess_video_frame(c
         std::max(f, static_cast<int>(std::nearbyint(static_cast<double>(size.width)  / f)) * f),
         std::max(f, static_cast<int>(std::nearbyint(static_cast<double>(size.height) / f)) * f),
     });
-}
-
-mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::resize_to(const mtmd_image_u8 & img, const mtmd_image_size & size) const {
-    mtmd_image_u8 resized_image;
-    img_tool::resize(img, resized_image, size,
-                        hparams.image_resize_algo,
-                        hparams.image_resize_pad,
-                        hparams.image_pad_color);
-    mtmd_image_preproc_out output;
-    output.append(hparams, resized_image, true);
-    return output;
 }
 
 //

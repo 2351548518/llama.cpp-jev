@@ -405,6 +405,14 @@ static void test_server_prompt_reuse(testing & t) {
         t.assert_true("cut at 95, no checkpoint", res.ckpt == nullptr);
         t.assert_equal("cut at 95, n_past", 0, res.n_past);
     });
+
+    t.test("swa prefix shorter than window", [&](testing & t) {
+        const auto prompt = make_prompt({});
+        const auto full = prompt.get_reuse(60, true, 128, 0);
+        t.assert_equal("whole window available", 60, full.n_past);
+        const auto evicted = prompt.get_reuse(60, true, 128, 1);
+        t.assert_equal("first token was evicted", 0, evicted.n_past);
+    });
 }
 
 static void test_lora_helpers(testing & t) {
@@ -668,6 +676,27 @@ static void test_decision_class_scores(testing & t) {
         }
         t.assert_true("nan or +inf", thrown);
     }
+}
+
+static void test_decision_laya_box(testing & t) {
+    server_decision_context ctx;
+    ctx.type = COMMON_DECISION_TYPE_LAYA_MULTIMODAL;
+    const server_decision_question question = {"object", SERVER_DECISION_QUESTION_BOX, "a red object", {}};
+    const auto answer = ctx.format_answer(question, {{1.0f, -1.0f, -1.0f, 1.0f, 0.0f}}, "image");
+    const auto & box = answer.at("box");
+    t.assert_equal("box type", answer.at("type").get<std::string>(), std::string("box"));
+    t.assert_equal("quality sigmoid", answer.at("confidence").get<double>(), 0.5);
+    t.assert_true("coordinates are ordered", box.at("left") == box.at("top") && box.at("left").get<double>() < box.at("right").get<double>());
+    const auto saturated = ctx.format_answer(question, {{1000.0f, 1000.0f, 1000.0f, 1000.0f, 0.0f}}, "image").at("box");
+    t.assert_true("saturation leaves positive area", saturated.at("right").get<double>() <= 1.0 &&
+                  saturated.at("right").get<double>() > saturated.at("left").get<double>());
+    bool rejected = false;
+    try {
+        ctx.format_answer(question, {{0.0f, 0.0f, 0.0f, 0.0f, INFINITY}}, "image");
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    t.assert_true("nonfinite Box result is rejected", rejected);
 }
 
 //
@@ -958,6 +987,7 @@ int main(int argc, char ** argv) {
     t.test("decision_escape", test_decision_escape);
     t.test("rerank_template", test_rerank_template);
     t.test("decision_class_scores", test_decision_class_scores);
+    t.test("decision_laya_box", test_decision_laya_box);
     t.test("decision_ocr_jev_validation", test_decision_ocr_jev_validation);
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
