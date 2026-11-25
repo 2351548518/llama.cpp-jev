@@ -14,9 +14,11 @@
 #include "mtmd-helper.h"
 #include "mtmd-helper-common.h"
 
+#include "hash/hash.h"
 #include "sheredom/subprocess.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -133,6 +135,29 @@ float parse_rational(const char * s) {
     return 0.0f;
 }
 
+double parse_duration_tag(const char * value) {
+    double hours, minutes, seconds;
+    char suffix;
+    if (sscanf(value, "%lf:%lf:%lf%c", &hours, &minutes, &seconds, &suffix) != 3 ||
+            !std::isfinite(hours) || !std::isfinite(minutes) || !std::isfinite(seconds) ||
+            hours < 0 || hours > INT32_MAX / 3600 || hours != std::floor(hours) ||
+            minutes < 0 || minutes >= 60 || minutes != std::floor(minutes) || seconds < 0 || seconds >= 60) {
+        return -1.0;
+    }
+    return hours * 3600 + minutes * 60 + seconds;
+}
+
+struct video_probe_cache_entry {
+    std::array<uint8_t, 32> hash = {};
+    size_t length = 0;
+    std::string ffprobe_bin;
+    mtmd_helper_video_stream_info info = {};
+    uint32_t src_width = 0;
+    uint32_t src_height = 0;
+    double video_start_s = 0.0;
+    bool fixed_rate = false;
+};
+
 struct ffmpeg_video {
     std::string path;
     std::vector<uint8_t> input_buf; // non-empty when opened from a buffer
@@ -155,15 +180,33 @@ struct ffmpeg_video {
     }
 
     bool probe(mtmd_helper_video_stream_info & info) {
+        // Header validation and decoding probe the same buffer on the same request thread.
+        // Keep only metadata, never media bytes; paths bypass the cache because files can change.
+        static thread_local std::array<video_probe_cache_entry, 4> cache;
+        static thread_local size_t next_entry = 0;
+        std::array<uint8_t, 32> hash = {};
+        if (is_buf_input()) {
+            hash = hash_sha256(input_buf.data(), input_buf.size());
+            for (const auto & entry : cache) {
+                if (entry.length == input_buf.size() && entry.hash == hash && entry.ffprobe_bin == ffprobe_bin) {
+                    info = entry.info;
+                    src_width = entry.src_width;
+                    src_height = entry.src_height;
+                    video_start_s = entry.video_start_s;
+                    fixed_rate = entry.fixed_rate;
+                    return true;
+                }
+            }
+        }
         // cache: makes stdin seekable; without it ffprobe reports width/height 0
         // for mp4 files whose moov atom sits at the end
         const char * input_arg = is_buf_input() ? "cache:pipe:0" : path.c_str();
         std::vector<const char *> cmd = {
             ffprobe_bin.c_str(),
             "-v", "quiet",
-            "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate,avg_frame_rate,nb_frames,duration,start_time:side_data=rotation:stream_tags=rotate",
+            "-show_entries", "stream=width,height,sample_aspect_ratio,r_frame_rate,avg_frame_rate,nb_frames,duration,start_time:side_data=rotation:stream_tags=rotate,DURATION:format=format_name,duration",
             "-select_streams", "v:0",
-            "-of", "default=noprint_wrappers=1",
+            "-of", "default=noprint_wrappers=0",
         };
         if (is_buf_input()) {
             // remove the 64KB read-ahead limit of cache:, or else ffprobe cannot reach a moov atom at end of file
@@ -193,10 +236,23 @@ struct ffmpeg_video {
         int sar_den  = 1;
         int rotation = 0;
         float avg_fps = 0.0f;
+        double tagged_end_s = -1.0;
+        double format_duration = -1.0;
+        bool in_format = false;
+        bool is_matroska = false;
         char line[256];
         FILE * fp = probe_sp.stdout_pipe();
 
         while (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strcmp(line, "[FORMAT]") == 0) {
+                in_format = true;
+                continue;
+            }
+            if (strcmp(line, "[/FORMAT]") == 0) {
+                in_format = false;
+                continue;
+            }
             char * eq = strchr(line, '=');
             if (!eq) continue;
             *eq = '\0';
@@ -205,7 +261,13 @@ struct ffmpeg_video {
             char * nl = (char *)strchr(val, '\n');
             if (nl) *nl = '\0';
 
-            if (strcmp(key, "width") == 0) {
+            if (in_format) {
+                if (strcmp(key, "duration") == 0 && strcmp(val, "N/A") != 0) {
+                    format_duration = std::strtod(val, nullptr);
+                } else if (strcmp(key, "format_name") == 0) {
+                    is_matroska = strstr(val, "matroska") != nullptr || strstr(val, "webm") != nullptr;
+                }
+            } else if (strcmp(key, "width") == 0) {
                 info.width = (uint32_t)atoi(val);
             } else if (strcmp(key, "height") == 0) {
                 info.height = (uint32_t)atoi(val);
@@ -225,10 +287,22 @@ struct ffmpeg_video {
                 }
             } else if (strcmp(key, "rotation") == 0 || strcmp(key, "TAG:rotate") == 0) {
                 rotation = atoi(val);
+            } else if (strcmp(key, "TAG:DURATION") == 0 || strcmp(key, "TAG:duration") == 0) {
+                tagged_end_s = parse_duration_tag(val);
             }
         }
 
         probe_sp.stop();
+
+        if (!(std::isfinite(info.duration) && info.duration > 0.0f)) {
+            // Matroska's DURATION tag is an end timestamp, including a nonzero stream start.
+            const double tagged_duration = tagged_end_s - video_start_s;
+            const double fallback = tagged_end_s >= 0.0 && tagged_duration > 0.0 ? tagged_duration :
+                format_duration - (is_matroska ? video_start_s : 0.0);
+            if (std::isfinite(fallback) && fallback > 0.0 && fallback <= INT32_MAX) {
+                info.duration = (float) fallback;
+            }
+        }
 
         // Rawvideo output can duplicate frames during rate conversion. Select by source
         // index only when the probe reports a fixed cadence starting at zero.
@@ -247,7 +321,12 @@ struct ffmpeg_video {
             std::swap(src_width, src_height);
             std::swap(info.width, info.height);
         }
-        return info.width > 0 && info.height > 0 && info.fps > 0.0f;
+        const bool valid = info.width > 0 && info.height > 0 && std::isfinite(info.fps) && info.fps > 0.0f;
+        if (valid && is_buf_input()) {
+            auto & entry = cache[next_entry++ % cache.size()];
+            entry = {hash, input_buf.size(), ffprobe_bin, info, src_width, src_height, video_start_s, fixed_rate};
+        }
+        return valid;
     }
 
     void load_soundtrack(int rate, size_t max_samples = SIZE_MAX) {

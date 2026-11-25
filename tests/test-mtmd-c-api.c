@@ -1,14 +1,130 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#undef NDEBUG
 #include <assert.h>
 
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+struct native_video_counts {
+    int opened;
+    int started;
+    int read;
+    int closed;
+};
+
+static void * native_video_open(void * user_data, const char * path, const unsigned char * buf, size_t len,
+                                struct mtmd_helper_video_stream_info * info) {
+    (void) path;
+    if (!buf || len < 12) {
+        return NULL;
+    }
+    struct native_video_counts * counts = (struct native_video_counts *) user_data;
+    counts->opened++;
+    *info = (struct mtmd_helper_video_stream_info) {2, 2, 2.0f, 4, 2.0f};
+    return counts;
+}
+
+static bool native_video_start(void * state, uint32_t width, uint32_t height, float fps, bool * fps_picked) {
+    (void) fps;
+    struct native_video_counts * counts = (struct native_video_counts *) state;
+    counts->started++;
+    *fps_picked = false;
+    return width > 0 && height > 0 && width <= 4096 && height <= 4096;
+}
+
+static bool native_video_read(void * state, unsigned char * rgb, uint32_t width, uint32_t height) {
+    struct native_video_counts * counts = (struct native_video_counts *) state;
+    if (counts->read++ >= 4 || width == 0 || height == 0 || width > 4096 || height > 4096) {
+        return false;
+    }
+    if (rgb) {
+        memset(rgb, 17, (size_t) width * height * 3);
+    }
+    return true;
+}
+
+static void native_video_close(void * state) {
+    ((struct native_video_counts *) state)->closed++;
+}
+
+static void test_native_video_decoder(void) {
+    struct native_video_counts counts = {0};
+    struct mtmd_helper_video_decoder decoder = {0};
+    decoder.open = native_video_open;
+    decoder.start = native_video_start;
+    decoder.read_frame = native_video_read;
+    decoder.close = native_video_close;
+    decoder.user_data = &counts;
+    struct mtmd_helper_init_opt options = mtmd_helper_init_opt_default();
+    options.video_params.decoder = &decoder;
+    const unsigned char video[] = "native-video-container";
+    struct mtmd_helper_media_meta meta;
+    assert(mtmd_helper_get_media_meta(video, sizeof(video), options, &meta) == 0);
+    assert(meta.type == MTMD_HELPER_MEDIA_TYPE_VIDEO && meta.width == 2 && meta.height == 2);
+    assert(meta.duration == 2.0f && meta.n_frames == 4);
+    assert(counts.opened == 1 && counts.closed == 1 && counts.started == 0);
+
+#ifdef MTMD_TEST_NO_FFMPEG
+    const unsigned char webp[] = "RIFF\0\0\0\0WEBP";
+    struct mtmd_helper_bitmap_wrapper image = mtmd_helper_bitmap_init_from_buf(NULL, webp, sizeof(webp), false, options);
+    assert(image.bitmap != NULL && image.video_ctx == NULL);
+    assert(mtmd_bitmap_get_nx(image.bitmap) == 2 && mtmd_bitmap_get_ny(image.bitmap) == 2);
+    assert(mtmd_bitmap_get_data(image.bitmap)[0] == 17);
+    mtmd_bitmap_free(image.bitmap);
+    assert(counts.opened == 2 && counts.closed == 2 && counts.started == 1 && counts.read == 1);
+#endif
+
+    const char * model_path = getenv("MTMD_TEST_MODEL");
+    const char * projector_path = getenv("MTMD_TEST_MMPROJ");
+    if (model_path && projector_path) {
+        struct llama_model_params model_params = llama_model_default_params();
+        model_params.vocab_only = true;
+        model_params.n_gpu_layers = 0;
+        struct llama_model * model = llama_model_load_from_file(model_path, model_params);
+        assert(model != NULL);
+        struct mtmd_context_params context_params = mtmd_context_params_default();
+        context_params.use_gpu = false;
+        context_params.warmup = false;
+        context_params.n_threads = 2;
+        struct mtmd_context * context = mtmd_init_from_file(projector_path, model, context_params);
+        assert(context != NULL);
+        memset(&counts, 0, sizeof(counts));
+        options.video_params.center_frames = 4;
+        options.video_params.prompt_template = MTMD_VIDEO_TEMPLATE_QWEN3VL_WRAPPED;
+        options.video_params.no_soundtrack = true;
+        mtmd_helper_video * reader = mtmd_helper_video_init_from_buf(context, video, sizeof(video), options.video_params);
+        assert(reader != NULL);
+        int frames = 0;
+        int code;
+        mtmd_bitmap * bitmap;
+        char * text;
+        while ((code = mtmd_helper_video_read_next(reader, &bitmap, &text)) == 0) {
+            if (bitmap) {
+                assert(mtmd_bitmap_get_data(bitmap)[0] == 17);
+                frames++;
+                mtmd_bitmap_free(bitmap);
+            }
+            free(text);
+        }
+        assert(code == -1 && frames == 4);
+        mtmd_helper_video_free(reader);
+        assert(counts.opened == 1 && counts.closed == 1 && counts.started == 1);
+        mtmd_free(context);
+        llama_model_free(model);
+        printf("Native callback video: four frames and balanced decoder lifetime\n");
+    }
+
+    decoder.read_frame = NULL;
+    assert(mtmd_helper_get_media_meta(video, sizeof(video), options, &meta) != 0);
+    assert(counts.opened == counts.closed);
+}
+
 int main(void) {
     printf("\n\nTesting libmtmd C API...\n");
     printf("--------\n\n");
+    test_native_video_decoder();
 
     struct mtmd_context_params params = mtmd_context_params_default();
     printf("Default image marker: %s\n", params.image_marker);

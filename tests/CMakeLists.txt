@@ -400,8 +400,20 @@ endif()
 
 # libmtmd
 llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
+if (NOT MTMD_VIDEO)
+    target_compile_definitions(test-mtmd-c-api PRIVATE MTMD_TEST_NO_FFMPEG)
+endif()
 
 llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
+
+if (MTMD_VIDEO AND BUILD_SHARED_LIBS)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-mtmd-video-probe
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtmd_video.py --library $<TARGET_FILE:mtmd>)
+        set_tests_properties(test-mtmd-video-probe PROPERTIES LABELS behavior SKIP_RETURN_CODE 77)
+    endif()
+endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

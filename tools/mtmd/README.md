@@ -65,3 +65,41 @@ NOTE: conversion scripts are located under `tools/mtmd/legacy-models`
 - [MiniCPM-o 4.0](../../docs/multimodal/minicpmo4.0.md)
 - [MiniCPM-V 4.5](../../docs/multimodal/minicpmv4.5.md)
 - [IBM Granite Vision](../../docs/multimodal/granitevision.md)
+
+## Built-in video decoding
+
+The FFmpeg decoder caches up to four successful buffer probes per calling thread. Each key includes the SHA-256 of the input and the path to ffprobe. The cache stores metadata records. File-path inputs are probed on every load. Video stream duration takes precedence over container duration, including when an audio track is longer than the video.
+
+## Native video decoding on Android and iOS
+
+Applications can build with `-DLLAMA_SUBPROCESS=OFF -DMTMD_VIDEO=OFF` and provide `mtmd_helper_video_decoder` from `mtmd-helper.h`. This path does not launch ffmpeg or ffprobe. Use Android MediaCodec/ImageReader or iOS AVFoundation to implement the callbacks, then pass the same decoder to both metadata inspection and bitmap loading:
+
+```cpp
+mtmd_helper_init_opt options = mtmd_helper_init_opt_default();
+options.video_params.decoder = &native_decoder;
+options.video_params.center_frames = 4;
+options.video_params.prompt_template = MTMD_VIDEO_TEMPLATE_QWEN3VL_WRAPPED;
+options.video_params.no_soundtrack = true;
+
+mtmd_helper_media_meta metadata;
+if (mtmd_helper_get_media_meta(bytes, length, options, &metadata) != 0) {
+    throw std::runtime_error("Unsupported or invalid media input");
+}
+auto media = mtmd_helper_bitmap_init_from_buf(mctx, bytes, length, false, options);
+if (!media.bitmap) {
+    throw std::runtime_error("Media decoding failed");
+}
+// Tokenize and consume media.bitmap while media.video_ctx is still alive.
+mtmd_bitmap_free(media.bitmap);
+if (media.video_ctx) {
+    mtmd_helper_video_free(media.video_ctx);
+}
+```
+
+The example options match the published four-frame Qwen3.5 decision checkpoint. Other checkpoints must use their own sampling/template settings. The callbacks must return display-oriented RGB24 at the requested width and height, with packed rows. `open` must own any bytes it retains; its input buffer is only valid during the call. Metadata inspection opens and closes its own decoder state without reading frames. Each subsequent load gets a fresh state. `close` must release that state's codec and buffer resources.
+
+For exact source-frame selection, implement `start_selected`; its indices are sorted and may repeat. Return each distinct requested frame once, since the helper repeats it when needed. If it is not provided, `read_frame` must return every source frame in presentation order, including when asked to skip one with `rgb == NULL`. A random-keyframe seek does not preserve these sampling rules. Streams with variable frame rates or nonzero start timestamps need matching presentation-time handling in the application's decoder.
+
+`test-mtmd-c-api` checks the callback lifetime and, with `MTMD_VIDEO=OFF`, decodes RGB pixels through the custom path. This is a portable integration check, not an Android/iPhone hardware performance measurement. Test the application adapter on its target device before reporting latency, memory or energy results.
+
+For the optional four-frame video check, set `MTMD_TEST_MODEL` to a local Qwen3.5 model GGUF and `MTMD_TEST_MMPROJ` to its matching projector before running `test-mtmd-c-api`. The text model is opened vocabulary-only and the vision encoder is not executed; the check exercises real model-specific video configuration, sampling, RGB delivery and decoder cleanup without a GPU or ffmpeg.
