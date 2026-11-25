@@ -4561,7 +4561,7 @@ private:
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
+                    do_checkpoint = do_checkpoint && !has_mtmd && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
@@ -4569,13 +4569,13 @@ private:
                     if (can_checkpoint && limited_rollback && is_decision && slot.task->params.cache_prompt &&
                             slot.can_split() && !slot.task->decision.pooled) {
                         // Keep the prefix state before the batch that reads the first decision output.
+                        // Media chunks have already been decoded separately for a split decision.
                         const int32_t first_output = n_decision_first >= 0 ? n_decision_first : slot.task->n_tokens() - 1;
                         do_checkpoint = n_tokens_start <= first_output && slot.prompt.n_tokens() > first_output &&
                                         n_tokens_start > (int64_t) slot.stats.n_prompt_cached;
                     }
 
-                    // A checkpoint needs an existing state and a batch without mtmd chunks.
-                    do_checkpoint = do_checkpoint && pos_min >= 0 && !has_mtmd;
+                    do_checkpoint = do_checkpoint && pos_min >= 0;
 
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
