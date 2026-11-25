@@ -16,7 +16,8 @@ const sources: AudioContext[] = [];
 
 /** A 440 Hz tone as a microphone stream. */
 function toneStream(): MediaStream {
-	const context = new AudioContext();
+	// Use a device-free audio clock on Chromium runners without speakers.
+	const context = new AudioContext({ sinkId: { type: 'none' } } as AudioContextOptions);
 	const oscillator = context.createOscillator();
 	const destination = context.createMediaStreamDestination();
 

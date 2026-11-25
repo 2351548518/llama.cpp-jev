@@ -200,9 +200,16 @@ describe('MarkdownEditor', () => {
 		const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect/></svg>';
 		const screen = render(MarkdownEditor, { value: `\`\`\`svg\n${svg}\n\`\`\`` });
 
-		await vi.waitFor(() => {
-			expect(screen.container.querySelector(`.cm-md-block [${SVG.RENDERED_ATTR}]`)).not.toBeNull();
-		});
+		await expect
+			.poll(
+				() => {
+					const host = screen.container.querySelector(`.cm-md-block [${SVG.RENDERED_ATTR}] > div`);
+
+					return host?.shadowRoot?.querySelector('svg rect');
+				},
+				{ timeout: 5000 }
+			)
+			.toBeInstanceOf(SVGRectElement);
 	});
 
 	it('lets the blank lines after a raw block be the gap to the next one', async () => {
