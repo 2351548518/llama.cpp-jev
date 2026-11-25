@@ -413,7 +413,8 @@ static bool write_file(const std::filesystem::path & path, const std::vector<cha
 static std::pair<long, std::vector<char>> gguf_http_get(
         const std::string & url,
         const httplib::Headers & headers = {},
-        int timeout_sec = 60) {
+        int timeout_sec = 60,
+        size_t max_bytes = 0) {
     try {
         auto [cli, parts] = common_http_client(url);
 
@@ -426,6 +427,10 @@ static std::pair<long, std::vector<char>> gguf_http_get(
         std::vector<char> body;
         auto res = cli.Get(parts.path, headers,
             [&](const char * data, size_t len) {
+                if (max_bytes > 0 && len > max_bytes - body.size()) {
+                    fprintf(stderr, "gguf_fetch: response exceeded byte range for %s\n", url.c_str());
+                    return false;
+                }
                 body.insert(body.end(), data, data + len);
                 return true;
             }, nullptr);
@@ -448,7 +453,7 @@ static std::pair<long, std::vector<char>> gguf_http_get(
 static std::string detect_gguf_filename(const std::string & repo, const std::string & quant,
                                         std::string & split_prefix) {
     split_prefix.clear();
-    std::string api_url = "https://huggingface.co/api/models/" + repo;
+    std::string api_url = common_get_model_endpoint() + "api/models/" + repo;
 
     auto [code, body] = gguf_http_get(api_url, {}, 30);
     if (code != 200 || body.empty()) {
@@ -518,7 +523,7 @@ static std::optional<gguf_remote_model> fetch_and_parse(
         const std::string & filename,
         const std::filesystem::path & cache_path,
         bool verbose) {
-    std::string url = "https://huggingface.co/" + repo + "/resolve/main/" + filename;
+    std::string url = common_get_model_endpoint() + repo + "/resolve/main/" + filename;
 
     // Progressive download inspired by RangeView.fetchChunk()
     // Start at 2MB, double each time, cap at 64MB
@@ -534,7 +539,7 @@ static std::optional<gguf_remote_model> fetch_and_parse(
         snprintf(range_buf, sizeof(range_buf), "bytes=0-%zu", chunk_size - 1);
         httplib::Headers headers = {{"Range", range_buf}};
 
-        auto [code, body] = gguf_http_get(url, headers, 120);
+        auto [code, body] = gguf_http_get(url, headers, 120, chunk_size);
         if (code != 200 && code != 206) {
             fprintf(stderr, "gguf_fetch: HTTP %ld fetching %s\n", code, url.c_str());
             return std::nullopt;

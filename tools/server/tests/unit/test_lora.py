@@ -3,7 +3,7 @@ from utils import *
 
 server = ServerPreset.stories15m_moe()
 
-LORA_FILE_URL = "https://huggingface.co/ggml-org-dev/stories15M_MOE/resolve/main/moe_shakespeare15M.gguf"
+LORA_FILE_URL = hf_model_url("ggml-org-dev/stories15M_MOE/resolve/main/moe_shakespeare15M.gguf")
 
 @pytest.fixture(autouse=True)
 def create_server():
@@ -179,7 +179,7 @@ def test_with_big_model():
     server.temperature = 0.0
     server.seed = 42
     server.lora_files = [
-        download_file("https://huggingface.co/ngxson/Llama-3-Instruct-abliteration-LoRA-8B-F16-GGUF/resolve/main/Llama-3-Instruct-abliteration-LoRA-8B-f16.gguf"),
+        download_file(hf_model_url("ngxson/Llama-3-Instruct-abliteration-LoRA-8B-F16-GGUF/resolve/main/Llama-3-Instruct-abliteration-LoRA-8B-f16.gguf")),
         # TODO: find & add other lora adapters for this model
     ]
     server.start(timeout_seconds=600)

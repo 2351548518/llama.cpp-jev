@@ -863,6 +863,11 @@ def match_regex(regex: str, text: str) -> bool:
     )
 
 
+def hf_model_url(path: str) -> str:
+    endpoint = os.environ.get("MODEL_ENDPOINT") or os.environ.get("HF_ENDPOINT") or "https://huggingface.co"
+    return f"{endpoint.rstrip('/')}/{path}"
+
+
 def download_file(url: str, output_file_path: str | None = None) -> str:
     """
     Download a file from a URL to a local path. If the file already exists, it will not be downloaded again.
@@ -874,6 +879,7 @@ def download_file(url: str, output_file_path: str | None = None) -> str:
     file_name = url.split('/').pop()
     output_file = f'./tmp/{file_name}' if output_file_path is None else output_file_path
     if not os.path.exists(output_file):
+        os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
         print(f"Downloading {url} to {output_file}")
         wget.download(url, out=output_file)
         print(f"Done downloading to {output_file}")

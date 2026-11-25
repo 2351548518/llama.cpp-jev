@@ -3,13 +3,12 @@ import re
 from dataclasses import dataclass
 
 import pytest
-from utils import ServerProcess, download_file
+from utils import ServerProcess, download_file, hf_model_url
 
 # Runs each speculative method greedily and checks that it still drafts and accepts as expected.
 # accept rate = accepted / drafted, accept len = 1 + accepted / verification steps (from /metrics).
 # Needs real models and a GPU. Use SPEC_METHODS=compact, nightly, all, or a comma-separated method list.
 
-HF = "https://huggingface.co"
 MODEL_REPO = "ggml-org/spec-for-testing-GGUF"
 MODEL_REVISION = "a0736c8e98d3fe580352dacffa3fbd5e9c22a437"
 
@@ -103,7 +102,7 @@ def model_path(file: str) -> str:
     model_dir = os.environ.get("SPEC_MODEL_DIR", "./tmp")
     os.makedirs(model_dir, exist_ok=True)
     return download_file(
-        f"{HF}/{MODEL_REPO}/resolve/{MODEL_REVISION}/{file}",
+        hf_model_url(f"{MODEL_REPO}/resolve/{MODEL_REVISION}/{file}"),
         os.path.join(model_dir, file),
     )
 

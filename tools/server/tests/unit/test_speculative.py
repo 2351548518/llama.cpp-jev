@@ -5,7 +5,7 @@ from utils import *
 
 server = ServerPreset.stories15m_moe()
 
-MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org-dev/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
+MODEL_DRAFT_FILE_URL = hf_model_url("ggml-org-dev/tiny-llamas/resolve/main/stories15M-q4_0.gguf")
 
 def create_server():
     global server
