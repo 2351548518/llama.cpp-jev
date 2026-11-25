@@ -4024,6 +4024,8 @@ private:
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
+                    const bool is_decision = slot.task->type == SERVER_TASK_TYPE_DECISION;
+                    const int32_t n_decision_first = is_decision ? slot.task->decision.pos_first() : -1;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -4106,7 +4108,6 @@ private:
                             }
 
                             // the outputs of a decision are read from one batch
-                            const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
                             if (n_decision_first >= 0 && slot.task->n_tokens() - n_decision_first > n_batch) {
                                 send_error(slot,
                                            string_format("the question and its options (%d tokens) are too large to process. "
@@ -4382,20 +4383,11 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
-
-                    // make checkpoints only for completion tasks
-                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
-
-                    // make a checkpoint of the parts of the memory that cannot be rolled back.
-                    // checkpoints are created only if:
-                    // - the model does not support partial sequence removal
-                    // - the model uses SWA (and we are not using `swa_full`)
-                    // - the model supports partial sequence removal but only up to a fixed bound
-                    do_checkpoint = do_checkpoint && (
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-                            n_swa > 0);
+                    const bool can_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    const bool limited_rollback = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                                  ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+                    bool do_checkpoint = can_checkpoint && (limited_rollback || n_swa > 0) &&
+                                         slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
@@ -4451,8 +4443,6 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
-
-                    const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -4570,20 +4560,23 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
-                    // nothing to checkpoint yet
-                    // TODO: is this check needed?
-                    if (do_checkpoint && pos_min < 0) {
-                        do_checkpoint = false;
-                    }
-
-                    // do not checkpoint after mtmd chunks
-                    do_checkpoint = do_checkpoint && !has_mtmd;
-
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
+
+                    if (can_checkpoint && limited_rollback && is_decision && slot.task->params.cache_prompt &&
+                            slot.can_split() && !slot.task->decision.pooled) {
+                        // Keep the prefix state before the batch that reads the first decision output.
+                        const int32_t first_output = n_decision_first >= 0 ? n_decision_first : slot.task->n_tokens() - 1;
+                        do_checkpoint = n_tokens_start <= first_output && slot.prompt.n_tokens() > first_output &&
+                                        n_tokens_start > (int64_t) slot.stats.n_prompt_cached;
+                    }
+
+                    // A checkpoint needs an existing state and a batch without mtmd chunks.
+                    do_checkpoint = do_checkpoint && pos_min >= 0 && !has_mtmd;
+
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

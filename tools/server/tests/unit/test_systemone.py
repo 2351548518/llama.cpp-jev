@@ -123,6 +123,7 @@ def test_systemone_cache_control(cache_prompt: bool):
     server = ServerPreset.tinyopenjev()
     server.server_metrics = True
     server.n_slots = 1
+    server.n_batch = server.n_ubatch = 32
     server.start()
     body = {"state": TEST_STATE, "questions": {"route": TEST_QUESTIONS["route"]}, "cache_prompt": cache_prompt}
     first = server.make_request("POST", "/v1/systemone", data=body)
