@@ -63,6 +63,7 @@ NOTE: conversion scripts are located under `tools/mtmd/legacy-models`
 - [MiniCPM-o 2.6](../../docs/multimodal/minicpmo2.6.md)
 - [MiniCPM-V 4.0](../../docs/multimodal/minicpmv4.0.md)
 - [MiniCPM-o 4.0](../../docs/multimodal/minicpmo4.0.md)
+- [MiniCPM-o 4.5](../../docs/multimodal/minicpmo4.5.md)
 - [MiniCPM-V 4.5](../../docs/multimodal/minicpmv4.5.md)
 - [IBM Granite Vision](../../docs/multimodal/granitevision.md)
 

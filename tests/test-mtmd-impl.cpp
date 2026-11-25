@@ -767,6 +767,59 @@ MAKE_TEST(test_audio_preprocessor_threads) {
     }
 }
 
+MAKE_TEST(test_whisper_variable_length_padding) {
+    mtmd_hparams hparams;
+    hparams.n_mel_bins = 80;
+    hparams.audio_n_fft = 400;
+    hparams.audio_window_len = 400;
+    hparams.audio_hop_len = 160;
+    hparams.audio_sample_rate = 16000;
+
+    ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    ggml_backend_t backends[] = { backend.get() };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 1, 256, false, true));
+
+    mtmd_hparams variable_hparams = hparams;
+    variable_hparams.audio_chunk_size = 3000;
+    variable_hparams.audio_proj_downsample_rate = 5;
+    mtmd_audio_preprocessor_whisper fixed(hparams, sched.get());
+    mtmd_audio_preprocessor_whisper variable(variable_hparams, sched.get());
+    fixed.initialize();
+    variable.initialize();
+
+    const float sample = 0.0f;
+    const auto short_audio = variable.preprocess(&sample, 1);
+    if (t.assert_equal("short audio chunks", size_t(1), short_audio.entries.size())) {
+        t.assert_equal("short audio frames", 10, short_audio.entries[0].nx());
+    }
+
+    for (int length : { 3200, 3237 }) {
+        std::vector<float> samples(length, 0.0f);
+        for (int i = length - 80; i < length; ++i) {
+            samples[i] = std::sin(0.13f * i);
+        }
+
+        auto full = fixed.preprocess(samples.data(), samples.size());
+        auto short_chunk = variable.preprocess(samples.data(), samples.size());
+        const int frames = (length + hparams.audio_hop_len - 1) / hparams.audio_hop_len;
+        if (!t.assert_true("mel frames", full.entries.size() == 1 && short_chunk.entries.size() == 1 &&
+                full.entries[0].nx() == 3000 && short_chunk.entries[0].nx() == frames) ||
+            !t.assert_true("compute", fixed.compute(full) && variable.compute(short_chunk))) {
+            return;
+        }
+
+        const auto & expected = full.entries[0].get_ro_buf();
+        const auto & actual = short_chunk.entries[0].get_ro_buf();
+        float max_diff = 0.0f;
+        for (int bin = 0; bin < hparams.n_mel_bins; ++bin) {
+            for (int frame = 0; frame < frames; ++frame) {
+                max_diff = std::max(max_diff, std::abs(expected[bin * 3000 + frame] - actual[bin * frames + frame]));
+            }
+        }
+        t.assert_true("Whisper mel normalization", max_diff < 1e-5f);
+    }
+}
+
 MAKE_TEST(test_audio_log_mel_precision) {
     const int n_mel    = 80;
     const int n_fft    = 400;

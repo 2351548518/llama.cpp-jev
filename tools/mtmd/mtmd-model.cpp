@@ -932,6 +932,7 @@ struct mtmd_model_loader {
                     } break;
                 case PROJECTOR_TYPE_ULTRAVOX:
                 case PROJECTOR_TYPE_QWEN2A:
+                case PROJECTOR_TYPE_MINICPMO4_5:
                 case PROJECTOR_TYPE_HIGGS_AUDIO:
                 case PROJECTOR_TYPE_QWEN3A:
                 case PROJECTOR_TYPE_GLMA:
@@ -967,6 +968,13 @@ struct mtmd_model_loader {
                             // each 4s chunk is encoded on its own
                             hparams.audio_chunk_len   = 4;
                             hparams.warmup_audio_size = 400;
+                        }
+                        if (model.proj_type == PROJECTOR_TYPE_MINICPMO4_5) {
+                            hparams.audio_chunk_size = 3000;
+                            get_u32(KEY_A_PROJ_DOWNSAMPLE_RATE, hparams.audio_proj_downsample_rate);
+                            if (hparams.audio_proj_downsample_rate < 1 || hparams.audio_proj_downsample_rate > hparams.audio_chunk_size / 2) {
+                                throw std::runtime_error("invalid MiniCPM-o audio projector downsample rate");
+                            }
                         }
                     } break;
                 case PROJECTOR_TYPE_VOXTRAL_RT:
@@ -3820,7 +3828,14 @@ struct mtmd_model_loader {
                     model.mm_2_w = get_tensor(mtmd_format(TN_MM_AUDIO_MLP, 2, "weight"));
                 } break;
             case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+            case PROJECTOR_TYPE_MINICPMO4_5:
                 {
+                    if (model.proj_type == PROJECTOR_TYPE_MINICPMO4_5) {
+                        const auto * pos = model.position_embeddings;
+                        if (!pos || pos->ne[0] != hparams.n_embd || pos->ne[1] < hparams.audio_chunk_size / 2) {
+                            throw std::runtime_error("invalid MiniCPM-o audio position embeddings");
+                        }
+                    }
                     model.conv1d_1_w = get_tensor(mtmd_format(TN_CONV1D, 1, "weight"));
                     model.conv1d_1_b = get_tensor(mtmd_format(TN_CONV1D, 1, "bias"));
                     model.conv1d_2_w = get_tensor(mtmd_format(TN_CONV1D, 2, "weight"));
@@ -4956,6 +4971,8 @@ int mtmd_model::n_output_tokens(const mtmd_image_f32 * img) const {
                     n_patches /= 2;
                 }
             } break;
+        case PROJECTOR_TYPE_MINICPMO4_5:
+            return (img->nx() + 1) / 2 / hparams.audio_proj_downsample_rate;
         case PROJECTOR_TYPE_HIGGS_AUDIO:
             {
                 // stride-2 conv1d, avgpool(2), stride-2 depthwise conv1d
@@ -5238,6 +5255,7 @@ int mtmd_model::n_mmproj_embd() const {
         case PROJECTOR_TYPE_NEMOTRON_TRANSCRIBE:
             return mm_fc_w->ne[1];
         case PROJECTOR_TYPE_QWEN3A:
+        case PROJECTOR_TYPE_MINICPMO4_5:
         case PROJECTOR_TYPE_HIGGS_AUDIO:
             return mm_2_w->ne[1];
         case PROJECTOR_TYPE_GLMA:

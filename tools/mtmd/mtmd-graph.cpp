@@ -870,6 +870,7 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
         case PROJECTOR_TYPE_ULTRAVOX:
         case PROJECTOR_TYPE_VOXTRAL:
         case PROJECTOR_TYPE_QWEN2A:
+        case PROJECTOR_TYPE_MINICPMO4_5:
         case PROJECTOR_TYPE_HIGGS_AUDIO:
         case PROJECTOR_TYPE_GLMA:
         case PROJECTOR_TYPE_MERALION:

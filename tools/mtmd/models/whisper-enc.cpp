@@ -77,6 +77,16 @@ ggml_cgraph * mtmd_graph_whisper_enc::build() {
         cur = build_mm(model.mm_fc_w, cur);
         cur = ggml_add(ctx0, cur, model.mm_fc_b);
 
+    } else if (proj_type == PROJECTOR_TYPE_MINICPMO4_5) {
+        cur = ggml_add(ctx0, build_mm(model.mm_1_w, cur), model.mm_1_b);
+        cur = ggml_relu(ctx0, cur);
+        cur = ggml_add(ctx0, build_mm(model.mm_2_w, cur), model.mm_2_b);
+
+        const int pool_size = hparams.audio_proj_downsample_rate;
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        cur = ggml_pool_1d(ctx0, cur, GGML_OP_POOL_AVG, pool_size, pool_size, 0);
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+
     } else if (proj_type == PROJECTOR_TYPE_HIGGS_AUDIO) {
         // depthwise conv (k=3, s=2, p=1) over time, then linear-relu-linear
         cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));

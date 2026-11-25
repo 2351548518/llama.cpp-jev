@@ -1451,6 +1451,12 @@ struct mtmd_context {
                     aud_end = "<|audio_eos|>";
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_higgs_audio>(models.a.get());
                 } break;
+            case PROJECTOR_TYPE_MINICPMO4_5:
+                {
+                    aud_beg = "<|audio_start|>";
+                    aud_end = "<|audio_end|>";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(models.a.get());
+                } break;
             case PROJECTOR_TYPE_VIBEVOICE_ASR:
                 {
                     aud_beg = "<|object_ref_start|>";

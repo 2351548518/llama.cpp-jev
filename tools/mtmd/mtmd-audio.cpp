@@ -338,7 +338,8 @@ static bool log_mel_spectrogram(
         const int     n_samples_in,
         const mtmd_audio_mel_config & params,
         const bool    shape_only,
-        mtmd_audio_mel & out) {
+        mtmd_audio_mel & out,
+        bool pad_full_chunk = true) {
     //const int64_t t_start_us = ggml_time_us();
 
     out.n_len_org = n_samples_in;
@@ -365,14 +366,12 @@ static bool log_mel_spectrogram(
         samples = samples_padded.data();
         n_samples = samples_padded.size();
     } else {
-        // existing padding logic
-        int64_t stage_1_pad = params.sample_rate * 30;
-        int64_t stage_2_pad = frame_size / 2;
+        // Retain windows that overlap the last samples for Whisper normalization.
+        const int64_t stage_2_pad = frame_size / 2;
+        const int64_t stage_1_pad = pad_full_chunk ? params.sample_rate * 30 : stage_2_pad;
         samples_padded.resize(n_samples + stage_1_pad + stage_2_pad * 2);
         std::copy(samples, samples + n_samples, samples_padded.begin() + stage_2_pad);
-        // pad 30 seconds of zeros at the end of audio (480,000 samples) + reflective pad 200 samples at the end of audio
-        std::fill(samples_padded.begin() + n_samples + stage_2_pad, samples_padded.begin() + n_samples + stage_1_pad + 2 * stage_2_pad, 0);
-        // reflective pad 200 samples at the beginning of audio
+        // reflect the start of audio
         if (n_samples < stage_2_pad + 1) {
             // TODO: Handle short audio differently or return error
             return false;
@@ -527,6 +526,10 @@ bool mtmd_audio_preprocessor_whisper::process(const float *                 samp
     std::vector<float> smpl;
     // reflection padding needs one sample plus half an FFT window
     size_t min_samples = (size_t) hparams.audio_n_fft / 2 + 1;
+    const int pool_size = hparams.audio_proj_downsample_rate;
+    if (pool_size > 0) {
+        min_samples = std::max(min_samples, (size_t) 2 * pool_size * hparams.audio_hop_len);
+    }
     if (n_samples < min_samples) {
         smpl.resize(min_samples, 0.0f);
         std::memcpy(smpl.data(), samples, n_samples * sizeof(float));
@@ -539,22 +542,22 @@ bool mtmd_audio_preprocessor_whisper::process(const float *                 samp
     GGML_ASSERT(!cache.cos_vals.empty());
     GGML_ASSERT(!cache.filters.data.empty());
 
+    const bool variable_length = hparams.audio_chunk_size > 0;
     mtmd_audio_mel out_full;
-    bool           ok = log_mel_spectrogram(samples, n_samples, mel_config, shape_only, out_full);
-    if (!ok) {
+    if (!log_mel_spectrogram(samples, n_samples, mel_config, shape_only, out_full, !variable_length)) {
         return false;
     }
 
     if (DEBUG) {
         printf("output: n_mel = %d, n_len = %d\n", (int) out_full.n_mel, (int) out_full.n_len);
     }
-    const bool variable_length = hparams.audio_chunk_size > 0;
     const size_t frames_per_chunk = variable_length ? hparams.audio_chunk_size : 3000;
+    const size_t min_frames = std::max(3, 2 * pool_size - 1);
     // round up, so a partial audio frame is not dropped with the padding
     const size_t n_audio_frames = (n_samples - 1) / (size_t) mel_config.hop_length + 1;
     for (size_t off = 0; off < n_audio_frames; off += frames_per_chunk) {
         const size_t n_len = variable_length ? std::min(frames_per_chunk, n_audio_frames - off) : frames_per_chunk;
-        if ((variable_length && n_len < 3) || off + n_len > (size_t) out_full.n_len) {
+        if ((variable_length && n_len < min_frames) || off + n_len > (size_t) out_full.n_len) {
             break;
         }
 

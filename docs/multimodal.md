@@ -78,6 +78,12 @@ NOTE: some models may require large context window, for example: `-c 8192`
 (tool_name) -hf ggml-org/Qwen2.5-VL-32B-Instruct-GGUF
 (tool_name) -hf ggml-org/Qwen2.5-VL-72B-Instruct-GGUF
 
+# Qwen3.5
+(tool_name) -hf unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
+
+# MiniCPM-V
+(tool_name) -hf openbmb/MiniCPM-V-4.7-1B-gguf:Q4_K_M
+
 # Mistral Small 3.1 24B (IQ2_M quantization)
 (tool_name) -hf ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
 
@@ -139,6 +145,8 @@ NOTE: some models may require large context window, for example: `-c 8192`
 (tool_name) -hf ggml-org/gemma-4-E2B-it-GGUF
 (tool_name) -hf ggml-org/gemma-4-E4B-it-GGUF
 ```
+
+For the split MiniCPM-o 4.5 release, combine the vision and audio encoders into one projector to use both inputs in the same request. See [MiniCPM-o 4.5](multimodal/minicpmo4.5.md).
 
 ## Finding more models:
 
