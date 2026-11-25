@@ -6539,6 +6539,10 @@ void server_routes::init_routes() {
         }
 
         const json body = json::parse(req.body);
+        if (body.contains("cache_prompt") && !body.at("cache_prompt").is_boolean()) {
+            throw std::invalid_argument("cache_prompt must be a boolean");
+        }
+        const bool cache_prompt = body.value("cache_prompt", params.cache_prompt);
         const auto questions = decision.parse_questions(body, meta->has_inp_audio);
         const size_t set_size = decision.set_size(questions);
 
@@ -6584,6 +6588,9 @@ void server_routes::init_routes() {
                         tasks.push_back(std::move(task));
                     }
                 }
+            }
+            for (auto & task : tasks) {
+                task.params.cache_prompt = cache_prompt;
             }
             if (decision.can_share_prompt()) {
                 tasks = server_decision_group_tasks(std::move(tasks), params.n_parallel);

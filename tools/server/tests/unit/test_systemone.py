@@ -117,6 +117,38 @@ def test_systemone_json_state():
     assert abs(res_obj.body["answers"]["refund"]["noul"] - res_str.body["answers"]["refund"]["noul"]) < 1e-4
 
 
+@pytest.mark.parametrize("cache_prompt", [True, False])
+def test_systemone_cache_control(cache_prompt: bool):
+    global server
+    server = ServerPreset.tinyopenjev()
+    server.server_metrics = True
+    server.n_slots = 1
+    server.start()
+    body = {"state": TEST_STATE, "questions": {"route": TEST_QUESTIONS["route"]}, "cache_prompt": cache_prompt}
+    first = server.make_request("POST", "/v1/systemone", data=body)
+    assert first.status_code == 200
+    _, before = get_prompt_metrics(server)
+    second = server.make_request("POST", "/v1/systemone", data=body)
+    assert second.status_code == 200
+    _, after = get_prompt_metrics(server)
+    assert (after > before) == cache_prompt
+    for key, value in first.body["answers"]["route"]["probabilities"].items():
+        assert abs(value - second.body["answers"]["route"]["probabilities"][key]) < 1e-4
+
+
+def test_systemone_cache_server_default():
+    global server
+    server = ServerPreset.tinyopenjev()
+    server.server_metrics = True
+    server.n_slots = 1
+    server.cache_prompt = False
+    server.start()
+    body = {"state": TEST_STATE, "questions": {"route": TEST_QUESTIONS["route"]}}
+    for _ in range(2):
+        assert server.make_request("POST", "/v1/systemone", data=body).status_code == 200
+    assert get_prompt_metrics(server)[1] == 0
+
+
 @pytest.mark.parametrize("data", [
     {"questions": TEST_QUESTIONS},
     {"state": TEST_STATE},
@@ -126,6 +158,7 @@ def test_systemone_json_state():
     {"state": TEST_STATE, "questions": {"q": {"type": "choice", "instructions": "x"}}},
     {"state": TEST_STATE, "questions": {"q": {"type": "choice", "instructions": "x", "criteria": {}}}},
     {"state": TEST_STATE, "questions": {"q": {"type": "score", "instructions": "x", "criteria": ["only one"]}}},
+    {"state": TEST_STATE, "questions": TEST_QUESTIONS, "cache_prompt": "false"},
 ])
 def test_systemone_invalid_request(data: dict):
     global server

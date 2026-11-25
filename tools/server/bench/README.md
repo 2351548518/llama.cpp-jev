@@ -2,6 +2,24 @@
 
 Benchmark is using [k6](https://k6.io/).
 
+### System One decision benchmark
+
+`bench_systemone.py` uses the Python standard library and a running local `/v1/systemone` server. It measures end-to-end request latency rather than generated tokens per second. Prepare a local JSONL file with a unique `id`, a request `body`, and optional `kind` and `media_paths` fields. Relative media paths are resolved against the manifest directory and converted to data URLs before timing:
+
+```json
+{"id":"route","kind":"text/choice","body":{"state":"The customer was charged twice.","questions":{"team":{"type":"choice","instructions":"Choose a team.","criteria":{"billing":"refunds","shipping":"delivery"}}}}}
+{"id":"locate","kind":"image/box","media_paths":["example.jpg"],"body":{"questions":{"target":{"type":"box","instructions":"the red cup"}}}}
+```
+
+```sh
+python tools/server/bench/bench_systemone.py --inputs requests.jsonl --output cold.json --repeat 5
+python tools/server/bench/bench_systemone.py --inputs requests.jsonl --output cached.json --repeat 5 --cache-prompt --compare cold.json
+```
+
+The report retains failed requests, success rate, P50/P95 latency, individual answers and output differences. Warmups are excluded from latency and reported separately if they fail. `--server-pid` also records peak resident memory on Linux. `--compare` requires the same request hashes; keep model/projector weights, context, batch size, frame sampling and backend fixed. Compare the common successful cases when one runtime fixes previously failing inputs, since adding valid video requests changes the latency distribution.
+
+`--cache-prompt` allows prefix reuse. The default disables prefix reuse and leaves slot state management to the server. Use one slot and clear its state between requests when checking parity from an empty slot. Recurrent decision models may need full prefill to reproduce every candidate readout. The reported latency and memory apply to the machine running the server.
+
 ##### Install k6 and sse extension
 
 SSE is not supported by default in k6, you have to build k6 with the [xk6-sse](https://github.com/phymbert/xk6-sse) extension.

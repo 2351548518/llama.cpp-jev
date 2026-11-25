@@ -1929,6 +1929,8 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 `images`: Optional. An alias of `files`.
 
+`cache_prompt`: Optional boolean that defaults to the server's `--cache-prompt` or `--no-cache-prompt` setting. Set it to `false` to disable prompt-prefix reuse. For cold-slot parity checks, use one slot and clear its state between requests. KV chunk shifting with `--cache-reuse` is unavailable for multimodal and non-shiftable recurrent contexts.
+
 `questions`: An object that maps a question id to a question. Each question has these fields:
 
 - `type`: One of `choice`, `score`, `noul`.

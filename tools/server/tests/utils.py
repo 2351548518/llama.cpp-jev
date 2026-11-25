@@ -21,10 +21,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import (
     Any,
     Callable,
-    ContextManager,
-    Iterable,
     Iterator,
     List,
+    Optional,
     Literal,
     Tuple,
     Set,
@@ -309,6 +308,8 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.cache_prompt is not None:
+            server_args.append("--cache-prompt" if self.cache_prompt else "--no-cache-prompt")
         if self.override_kv:
             server_args.extend(["--override-kv", self.override_kv])
         if self.no_cache_idle_slots:
