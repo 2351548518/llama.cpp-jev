@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import pytest
 from utils import *
 
@@ -15,6 +16,16 @@ class LogReader:
             content = f.read()
             self.pos = f.tell()
         return content
+
+    def wait_for(self, message):
+        deadline = time.monotonic() + 2
+        content = ""
+        while time.monotonic() < deadline:
+            content += self.drain()
+            if message in content:
+                return
+            time.sleep(0.01)
+        pytest.fail(f"server did not log {message}")
 
 @pytest.fixture(autouse=True)
 def create_server():
@@ -48,7 +59,7 @@ def test_clear_and_restore():
     log = LogReader(server.log_path)
 
     # verify feature is enabled
-    assert "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__" in log.drain()
+    log.wait_for("__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__")
 
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
@@ -68,7 +79,7 @@ def test_clear_and_restore():
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
+    log.wait_for("__TEST_TAG_CACHE_IDLE_SLOT__")
 
     # Re-send same prompt — should restore from cache-ram
     res = server.make_request("POST", "/completion", data={
@@ -76,7 +87,7 @@ def test_clear_and_restore():
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "updating prompt cache" in log.drain()
+    log.wait_for("__TEST_TAG_PROMPT_CACHE_RESTORE__")
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < original_prompt_n
 

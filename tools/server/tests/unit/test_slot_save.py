@@ -699,8 +699,14 @@ def parse_ckpt_appendix(data):
 
 # a damaged appendix must be ignored, or its checkpoints dropped when they fail to load, without aborting the server
 @pytest.mark.parametrize("damage", ["oversized_blob", "empty_target", "corrupt_state", "many_checkpoints"])
-def test_slot_restore_damaged_checkpoint_appendix(swa_server, damage):
-    server = swa_server
+def test_slot_restore_damaged_checkpoint_appendix(tmp_path, damage):
+    server = ServerPreset.tinylfm3omni()
+    server.slot_save_path = str(tmp_path)
+    server.n_slots = 2
+    server.n_ubatch = 32
+    server.n_predict = 4
+    server.temperature = 0.0
+    server.cache_ram = 0
     server.start()
 
     base = "The quick brown fox jumps over the lazy dog. " * 20
