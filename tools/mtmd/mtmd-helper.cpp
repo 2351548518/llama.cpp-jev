@@ -1072,7 +1072,13 @@ int32_t mtmd_helper_get_media_meta(const unsigned char * buf, size_t len, mtmd_h
         params.decoder = nullptr; // see decode_still_image()
     }
     mtmd_helper_video_stream_info src;
-    if (!video_open(nullptr, buf, len, params, src)) {
+#ifdef MTMD_VIDEO
+    const bool opened = params.decoder ? video_open(nullptr, buf, len, params, src) != nullptr :
+        mtmd_helper_video_probe_ffmpeg(params.ffmpeg_bin_dir, buf, len, src);
+#else
+    const bool opened = video_open(nullptr, buf, len, params, src) != nullptr;
+#endif
+    if (!opened) {
         return 1;
     }
     out->type   = is_webp ? MTMD_HELPER_MEDIA_TYPE_IMAGE : MTMD_HELPER_MEDIA_TYPE_VIDEO;

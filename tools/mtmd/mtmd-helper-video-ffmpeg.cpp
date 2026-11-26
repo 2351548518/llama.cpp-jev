@@ -79,8 +79,8 @@ struct subprocess_handle {
     }
 
     // buf must outlive the feeder thread, i.e. this handle
-    void start_feeder(const std::vector<uint8_t> & buf) {
-        feeder = std::thread([this, &buf]() {
+    void start_feeder(const unsigned char * buf, size_t len) {
+        feeder = std::thread([this, buf, len]() {
 #ifndef _WIN32
             // ffmpeg can exit before it reads all the input, for example when ffprobe already got the metadata.
             // the write below must then fail with EPIPE, instead of killing the process with SIGPIPE
@@ -96,7 +96,7 @@ struct subprocess_handle {
 #ifdef F_SETNOSIGPIPE
             fcntl(fileno(f), F_SETNOSIGPIPE, 1); // macos/bsd send it to the process, so turn it off per fd
 #endif
-            fwrite(buf.data(), 1, buf.size(), f);
+            fwrite(buf, 1, len, f);
             fclose(f);
             proc.stdin_file = nullptr; // prevent double-close in subprocess_destroy
         });
@@ -179,16 +179,18 @@ struct ffmpeg_video {
         return !input_buf.empty();
     }
 
-    bool probe(mtmd_helper_video_stream_info & info) {
+    bool probe(mtmd_helper_video_stream_info & info, const unsigned char * buf, size_t len) {
+        info = {0, 0, 0.0f, -1, -1.0f};
+        const bool buffered = buf && len > 0;
         // Header validation and decoding probe the same buffer on the same request thread.
         // Keep only metadata, never media bytes; paths bypass the cache because files can change.
         static thread_local std::array<video_probe_cache_entry, 4> cache;
         static thread_local size_t next_entry = 0;
         std::array<uint8_t, 32> hash = {};
-        if (is_buf_input()) {
-            hash = hash_sha256(input_buf.data(), input_buf.size());
+        if (buffered) {
+            hash = hash_sha256(buf, len);
             for (const auto & entry : cache) {
-                if (entry.length == input_buf.size() && entry.hash == hash && entry.ffprobe_bin == ffprobe_bin) {
+                if (entry.length == len && entry.hash == hash && entry.ffprobe_bin == ffprobe_bin) {
                     info = entry.info;
                     src_width = entry.src_width;
                     src_height = entry.src_height;
@@ -200,7 +202,7 @@ struct ffmpeg_video {
         }
         // cache: makes stdin seekable; without it ffprobe reports width/height 0
         // for mp4 files whose moov atom sits at the end
-        const char * input_arg = is_buf_input() ? "cache:pipe:0" : path.c_str();
+        const char * input_arg = buffered ? "cache:pipe:0" : path.c_str();
         std::vector<const char *> cmd = {
             ffprobe_bin.c_str(),
             "-v", "quiet",
@@ -208,7 +210,7 @@ struct ffmpeg_video {
             "-select_streams", "v:0",
             "-of", "default=noprint_wrappers=0",
         };
-        if (is_buf_input()) {
+        if (buffered) {
             // remove the 64KB read-ahead limit of cache:, or else ffprobe cannot reach a moov atom at end of file
             cmd.insert(cmd.end(), {"-read_ahead_limit", "-1"});
         }
@@ -228,8 +230,8 @@ struct ffmpeg_video {
         probe_sp.created = true;
         probe_sp.alive   = true;
 
-        if (is_buf_input()) {
-            probe_sp.start_feeder(input_buf);
+        if (buffered) {
+            probe_sp.start_feeder(buf, len);
         }
 
         int sar_num  = 1;
@@ -322,9 +324,9 @@ struct ffmpeg_video {
             std::swap(info.width, info.height);
         }
         const bool valid = info.width > 0 && info.height > 0 && std::isfinite(info.fps) && info.fps > 0.0f;
-        if (valid && is_buf_input()) {
+        if (valid && buffered) {
             auto & entry = cache[next_entry++ % cache.size()];
-            entry = {hash, input_buf.size(), ffprobe_bin, info, src_width, src_height, video_start_s, fixed_rate};
+            entry = {hash, len, ffprobe_bin, info, src_width, src_height, video_start_s, fixed_rate};
         }
         return valid;
     }
@@ -351,7 +353,7 @@ struct ffmpeg_video {
         audio_sp.created = true;
         audio_sp.alive   = true;
         if (is_buf_input()) {
-            audio_sp.start_feeder(input_buf);
+            audio_sp.start_feeder(input_buf.data(), input_buf.size());
         }
         float block[4096];
         FILE * out = audio_sp.stdout_pipe();
@@ -442,7 +444,7 @@ struct ffmpeg_video {
 
         if (is_buf_input()) {
             LOG_DBG("%s: starting feeder thread for %zu-byte buffer\n", __func__, input_buf.size());
-            sp.start_feeder(input_buf);
+            sp.start_feeder(input_buf.data(), input_buf.size());
         }
         return true;
     }
@@ -474,14 +476,16 @@ void * ffmpeg_open(void * user_data, const char * path, const unsigned char * bu
     const char * bin_dir = static_cast<const char *>(user_data);
     v->ffmpeg_bin  = resolve_bin(bin_dir, "ffmpeg");
     v->ffprobe_bin = resolve_bin(bin_dir, "ffprobe");
-    if (buf && len > 0) {
-        v->input_buf.assign(buf, buf + len);
-    } else if (path) {
+    const bool buffered = buf && len > 0;
+    if (!buffered && path) {
         v->path = path;
     }
-    if (!v->probe(*info)) {
-        LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, v->is_buf_input() ? "<buffer>" : v->path.c_str());
+    if (!v->probe(*info, buf, len)) {
+        LOG_ERR("%s: ffprobe failed for '%s' (is ffprobe in PATH?)\n", __func__, buffered ? "<buffer>" : v->path.c_str());
         return nullptr;
+    }
+    if (buffered) {
+        v->input_buf.assign(buf, buf + len);
     }
     return v.release();
 }
@@ -542,6 +546,13 @@ void ffmpeg_close(void * state) {
 }
 
 } // namespace
+
+bool mtmd_helper_video_probe_ffmpeg(const char * bin_dir, const unsigned char * buf, size_t len,
+                                  mtmd_helper_video_stream_info & info) {
+    ffmpeg_video video;
+    video.ffprobe_bin = resolve_bin(bin_dir, "ffprobe");
+    return video.probe(info, buf, len);
+}
 
 const mtmd_helper_video_decoder * mtmd_helper_video_decoder_ffmpeg() {
     static const mtmd_helper_video_decoder decoder = {

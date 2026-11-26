@@ -2163,8 +2163,7 @@ void server_models_routes::init_routes() {
         models.proxy_ws(req, conn, name);
     };
 
-    const auto proxy_post_json = [this](const server_http_req & req, const json & body) {
-        std::string name = json_value(body, "model", std::string());
+    const auto proxy_post_model = [this](const server_http_req & req, std::string name) {
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
@@ -2192,22 +2191,32 @@ void server_models_routes::init_routes() {
         return models.proxy_request(req, "POST", name, true, waited && ticket != 0); // update last usage for POST request only
     };
 
-    this->proxy_post = [proxy_post_json](const server_http_req & req) {
-        return proxy_post_json(req, json::parse(req.body));
+    this->proxy_post = [proxy_post_model](const server_http_req & req) {
+        auto name = json_value(json::parse(req.body), "model", std::string());
+        return proxy_post_model(req, std::move(name));
     };
 
-    this->proxy_post_systemone = [proxy_post_json](const server_http_req & req) {
-        const auto body = server_decision_request_json(req);
-        if (req.multipart && req.files.empty()) {
-            // Inline assets can be forwarded as JSON when the envelope has no file parts.
-            const server_http_req forwarded = { req.params, req.headers, req.path, req.query_string, body.dump(), {}, req.should_stop };
-            return proxy_post_json(forwarded, body);
+    this->proxy_post_systemone = [proxy_post_model](const server_http_req & req) {
+        std::string name;
+        std::string json_body;
+        {
+            const auto body = server_decision_request_json(req);
+            name = json_value(body, "model", std::string());
+            if (req.multipart && req.files.empty()) {
+                // Forward inline assets as JSON when the envelope has no file parts.
+                json_body = body.dump();
+            }
         }
-        return proxy_post_json(req, body);
+        if (!json_body.empty()) {
+            const server_http_req forwarded = { req.params, req.headers, req.path, req.query_string, std::move(json_body), {}, req.should_stop };
+            return proxy_post_model(forwarded, std::move(name));
+        }
+        return proxy_post_model(req, std::move(name));
     };
 
-    this->proxy_post_multimodal = [proxy_post_json](const server_http_req & req) {
-        return proxy_post_json(req, server_decision_request_json(req, true));
+    this->proxy_post_multimodal = [proxy_post_model](const server_http_req & req) {
+        auto name = json_value(server_decision_request_json(req, true), "model", std::string());
+        return proxy_post_model(req, std::move(name));
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {

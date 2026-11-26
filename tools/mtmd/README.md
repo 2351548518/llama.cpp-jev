@@ -69,9 +69,11 @@ NOTE: conversion scripts are located under `tools/mtmd/legacy-models`
 
 ## Built-in video decoding
 
-The FFmpeg decoder caches up to four successful buffer probes per calling thread. Each key includes the SHA-256 of the input and the path to ffprobe. The cache stores metadata records. File-path inputs are probed on every load. Video stream duration takes precedence over container duration, including when an audio track is longer than the video.
+FFmpeg metadata inspection reads the caller's buffer during the call. A decoder that reads frames or audio keeps its own copy. The FFmpeg decoder caches up to four successful buffer probes per calling thread. Each key includes the SHA-256 of the input and the path to ffprobe. The cache stores metadata records. File-path inputs are probed on every load. Video stream duration takes precedence over container duration, including when an audio track is longer than the video.
 
 ## Native video decoding on Android and iOS
+
+This fork builds `libmtmd` with shared-library ABI version 2. Rebuild native bindings and applications with the matching headers when upgrading from ABI version 1 or from upstream.
 
 Applications can build with `-DLLAMA_SUBPROCESS=OFF -DMTMD_VIDEO=OFF` and provide `mtmd_helper_video_decoder` from `mtmd-helper.h`. This path does not launch ffmpeg or ffprobe. Use Android MediaCodec/ImageReader or iOS AVFoundation to implement the callbacks, then pass the same decoder to both metadata inspection and bitmap loading:
 

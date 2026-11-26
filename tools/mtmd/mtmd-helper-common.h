@@ -70,9 +70,12 @@ inline mtmd_helper_logger g_logger;
 //
 
 struct mtmd_helper_video_decoder;
+struct mtmd_helper_video_stream_info;
 
 // only with MTMD_VIDEO; the user_data of open() is ffmpeg_bin_dir
 const mtmd_helper_video_decoder * mtmd_helper_video_decoder_ffmpeg();
+bool mtmd_helper_video_probe_ffmpeg(const char * bin_dir, const unsigned char * buf, size_t len,
+                                  mtmd_helper_video_stream_info & info);
 
 //
 // embd batch
