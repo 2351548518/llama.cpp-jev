@@ -818,11 +818,12 @@ void server_http_context::get(const std::string & path, const server_http_contex
 
 void server_http_context::post(const std::string & path, const server_http_context::handler_t & handler) const {
     handlers.emplace(path, handler);
-    auto callback = [handler](const httplib::Request & req, httplib::Response & res) {
-        std::string body = req.body;
+    auto callback = [handler, systemone = path == "/v1/systemone"](const httplib::Request & req, httplib::Response & res) {
+        const bool multipart = req.is_multipart_form_data();
+        std::string body;
         std::map<std::string, uploaded_file> files;
 
-        if (req.is_multipart_form_data()) {
+        if (multipart) {
             // translate text fields to a JSON object and use it as the body
             json form_json = json::object();
             for (const auto & [key, field] : req.form.fields) {
@@ -841,12 +842,20 @@ void server_http_context::post(const std::string & path, const server_http_conte
 
             // populate files from multipart form
             for (const auto & [key, file] : req.form.files) {
+                if (systemone && (files.count(key) || form_json.contains(key))) {
+                    res.status = 400;
+                    res.set_content(format_error_response("multipart part names must be unique", ERROR_TYPE_INVALID_REQUEST).dump(),
+                                    "application/json");
+                    return;
+                }
                 files[key] = uploaded_file{
                     raw_buffer(file.content.begin(), file.content.end()),
                     file.filename,
                     file.content_type,
                 };
             }
+        } else {
+            body = req.body;
         }
 
         server_http_req_ptr request = std::make_unique<server_http_req>(server_http_req{
@@ -854,9 +863,10 @@ void server_http_context::post(const std::string & path, const server_http_conte
             get_headers(req),
             req.path,
             build_query_string(req),
-            body,
+            std::move(body),
             std::move(files),
-            req.is_connection_closed
+            req.is_connection_closed,
+            multipart,
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);

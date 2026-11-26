@@ -1134,6 +1134,24 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
+static server_tokens tokenize_mtmd_prompt(
+        mtmd_context * mctx,
+        const std::string & prompt,
+        bool add_special,
+        const std::vector<const mtmd_bitmap *> & bitmaps) {
+    const mtmd_input_text text = {
+        prompt.data(),
+        prompt.size(),
+        /* add_special */   add_special,
+        /* parse_special */ true,
+    };
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    if (mtmd_tokenize(mctx, chunks.ptr.get(), &text, bitmaps.data(), bitmaps.size()) != 0) {
+        throw std::runtime_error("Failed to tokenize prompt");
+    }
+    return server_tokens(chunks, true);
+}
+
 server_tokens process_mtmd_prompt(
         mtmd_context * mctx,
         const std::string & prompt,
@@ -1141,68 +1159,78 @@ server_tokens process_mtmd_prompt(
         const mtmd_helper_init_opt & init_opt,
         bool is_placeholder,
         bool add_special) {
-    // these will be freed upon going out of scope
-    mtmd::bitmaps bitmaps;
     std::vector<mtmd_helper::video_ptr> videos;
-    for (auto & file : files) {
-        auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
-        if (!out.bitmap) {
+    mtmd::bitmaps bitmaps;
+    bitmaps.entries.reserve(files.size());
+    for (const auto & file : files) {
+        const auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+        mtmd_helper::video_ptr video(out.video_ctx);
+        mtmd::bitmap bitmap(out.bitmap);
+        if (!bitmap.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
         }
-        bitmaps.entries.emplace_back(out.bitmap);
-        if (out.video_ctx) {
-            videos.emplace_back(out.video_ctx);
+        if (video) {
+            videos.push_back(std::move(video));
         }
+        bitmaps.entries.push_back(std::move(bitmap));
     }
-    // process prompt
-    std::vector<server_tokens> inputs;
-    // multimodal
-    mtmd_input_text inp_txt = {
-        prompt.data(),
-        prompt.size(),
-        /* add_special */   add_special,
-        /* parse_special */ true,
-    };
-    mtmd::input_chunks chunks(mtmd_input_chunks_init());
-    auto bitmaps_c_ptr = bitmaps.c_ptr();
-    int32_t tokenized = mtmd_tokenize(mctx,
-                                      chunks.ptr.get(),
-                                      &inp_txt,
-                                      bitmaps_c_ptr.data(),
-                                      bitmaps_c_ptr.size());
-    if (tokenized != 0) {
-        throw std::runtime_error("Failed to tokenize prompt");
-    }
-    auto result = server_tokens(chunks, true);
-    return result;
+    return tokenize_mtmd_prompt(mctx, prompt, add_special, bitmaps.c_ptr());
 }
 
 server_mtmd_input::server_mtmd_input(mtmd_context * ctx, const llama_vocab * vocab, const std::vector<raw_buffer> & files,
                                      const mtmd_helper_init_opt & options)
     : ctx(ctx), files(files), options(options), vocab(vocab) {}
 
-server_tokens server_mtmd_input::tokenize(const std::string & prompt, bool add_special) {
-    if (files.empty()) {
+server_tokens server_mtmd_input::tokenize_assets(
+        const std::string & prompt, bool add_special, const std::vector<size_t> & image_order) {
+    asset_bitmaps.resize(files.size());
+    std::vector<const mtmd_bitmap *> bitmaps;
+    bitmaps.reserve(image_order.size());
+    for (const size_t index : image_order) {
+        auto & bitmap = asset_bitmaps.at(index);
+        if (!bitmap) {
+            const auto & file = files[index];
+            const auto out = mtmd_helper_bitmap_init_from_buf(ctx, file.data(), file.size(), false, options);
+            mtmd_helper::video_ptr video(out.video_ctx);
+            mtmd::bitmap_ptr decoded(out.bitmap);
+            if (!decoded || video) {
+                throw std::invalid_argument("Failed to decode still image asset");
+            }
+            bitmap = std::move(decoded);
+        }
+        bitmaps.push_back(bitmap.get());
+    }
+    return tokenize_mtmd_prompt(ctx, prompt, add_special, bitmaps);
+}
+
+server_tokens server_mtmd_input::tokenize(const std::string & prompt, bool add_special, const std::vector<size_t> * image_order) {
+    if (image_order ? image_order->empty() : files.empty()) {
         return server_tokens(common_tokenize(vocab, prompt, add_special, true), false);
     }
 
+    auto tokenize_media = [&](const std::string & text) {
+        return image_order ? tokenize_assets(text, add_special, *image_order) :
+            process_mtmd_prompt(ctx, text, files, options, false, add_special);
+    };
     const std::string_view marker = mtmd_get_marker(ctx);
     const size_t last_marker = prompt.rfind(marker);
     if (last_marker == std::string::npos) {
-        return process_mtmd_prompt(ctx, prompt, files, options, false, add_special);
+        return tokenize_media(prompt);
     }
     const size_t end = last_marker + marker.size();
     const std::string_view head(prompt.data(), end);
     const bool add_eos = add_special && llama_vocab_get_add_eos(vocab);
-    if (head != prefix || add_special != prefix_add_special) {
+    const bool same_images = image_order ? *image_order == prefix_image_order : prefix_image_order.empty();
+    if (head != prefix || add_special != prefix_add_special || !same_images) {
         std::string new_prefix(head);
-        auto tokens = process_mtmd_prompt(ctx, new_prefix, files, options, false, add_special);
+        auto tokens = tokenize_media(new_prefix);
         if (add_eos) {
             tokens.keep_first(tokens.size() - 1);
         }
         prefix = std::move(new_prefix);
         prefix_tokens = std::move(tokens);
         prefix_add_special = add_special;
+        prefix_image_order = image_order ? *image_order : std::vector<size_t>();
     }
 
     // The tokenizer already splits the text at each media marker.

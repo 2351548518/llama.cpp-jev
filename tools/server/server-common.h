@@ -344,21 +344,26 @@ server_tokens process_mtmd_prompt(
                                           bool add_special = true);
 
 // Tokenize prompts with the same media in one request. The prefix through the last media
-// marker can be reused when its text and special-token settings match.
+// marker can be reused when its text, still-image order and special-token settings match.
 struct server_mtmd_input {
     server_mtmd_input(mtmd_context * ctx, const llama_vocab * vocab, const std::vector<raw_buffer> & files,
                       const mtmd_helper_init_opt & options);
 
-    server_tokens tokenize(const std::string & prompt, bool add_special = true);
+    server_tokens tokenize(const std::string & prompt, bool add_special = true,
+                           const std::vector<size_t> * image_order = nullptr);
 
     mtmd_context * const ctx;
     const std::vector<raw_buffer> & files;
     const mtmd_helper_init_opt options;
 
 private:
+    server_tokens tokenize_assets(const std::string & prompt, bool add_special, const std::vector<size_t> & image_order);
+
     const llama_vocab * const vocab;
+    std::vector<mtmd::bitmap_ptr> asset_bitmaps;
     std::string prefix;
     server_tokens prefix_tokens;
+    std::vector<size_t> prefix_image_order;
     bool prefix_add_special = false;
 };
 

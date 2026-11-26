@@ -2062,6 +2062,8 @@ curl http://127.0.0.1:9931/v1/systemone \
 
 An invalid request returns the error `400`. A model that is not a decision model returns the error `501`. A request with images returns the error `501` if the model does not support image input, or if no multimodal projector is loaded.
 
+Standard Qwen3.5 and Gemma GGUFs use `/v1/chat/completions` for generation. A matching `--mmproj` enables the model's media inputs on the same endpoint. The router can serve these models alongside decision checkpoints by selecting the `model` field for each request. The decision endpoints require a compatible decision checkpoint. See [multimodal input](../../docs/multimodal.md) and [router configuration](#using-multiple-models).
+
 #### Laya native multimodal checkpoints
 
 Export a `MultimodalAgent.save()` directory with its saved processor and base model. The exporter uses the Transformers conversion environment and merges standard LoRA weights during export. It writes the model and media encoders together into a new directory. Use `--base` if the saved base model path moved.
@@ -2072,11 +2074,34 @@ llama-server -m /path/to/laya-gguf/model.gguf --mmproj /path/to/laya-gguf/mmproj
     -ngl 999 -c 8192 -b 1024 -ub 1024 -np 1
 ```
 
-Qwen3.5 checkpoints read text, images, and video frames. Gemma 4 E2B also reads native audio. Qwen2.5-Omni checkpoints with a letter head read video as timestamped images and support native audio. Audio-capable checkpoints can use the video soundtrack when `use_audio_in_video` is enabled in the checkpoint. Video uses the checkpoint's frame count and needs `ffmpeg` and `ffprobe` on the server. Submit media as data URLs in `files`. A media-only request may omit `state`. Set the context size for the processed media and text. For a candidate head, set `--batch-size` to fit the suffix from the first candidate marker through the end of its prompt.
+The same decision GGUF and projector can be loaded with different enabled backends. Use `llama-server --list-devices` to see the devices in the current build. Set `--device none --no-mmproj-offload` to run the language model and projector on the CPU. See the [backend build instructions](../../docs/build.md) and the [local GGUF tests](./tests/README.md).
 
-The decision head preserves the checkpoint's option ordering and modality calibration. `choice` accepts an object or an array of scalar labels. Candidate checkpoints allow up to 256 options within the context and batch budgets. Each discrete question accepts an `option_order` permutation. `noul` accepts custom `labels` for `false` and `true` and returns P(true) in canonical order.
+Qwen3.5 checkpoints read text, images, and video frames. Gemma 4 E2B also reads native audio. Qwen2.5-Omni checkpoints with a letter head read video as timestamped images and support native audio. Audio-capable checkpoints can use the video soundtrack when `use_audio_in_video` is enabled in the checkpoint. Video uses the checkpoint's frame count and needs `ffmpeg` and `ffprobe` on the server. Submit media as data URLs in `files`. A media-only request may omit `state`. Set the context size for the processed media and text. Causal candidate heads retain their candidate vectors across prompt batches.
+
+The decision head preserves the checkpoint's option ordering and modality calibration. `choice` accepts an object or an array of scalar labels. Causal candidate checkpoints allow up to 256 options within the context budget. Each discrete question accepts an `option_order` permutation. `noul` accepts custom `labels` for `false` and `true` and returns P(true) in canonical order.
 
 With a trained single-box head, a question such as `{"type":"box","instructions":"the red mug"}` takes exactly one still image. Its answer contains `box` with normalized `top`, `bottom`, `left` and `right` edges, and a `confidence` estimating localization quality. A separate `noul` question can ask whether the target is present.
+
+#### TypeSafe image references for Laya checkpoints
+
+Send `TypeSafe-Danger-Zone-Images: true` and an `assets` object. The server inserts each image wherever its asset name appears in a string value in `state`, `instructions`, or `criteria`. An inline asset has `format` and `data_base64`. A multipart asset has a `part` matching the upload field name. Both accept an optional `type: "image"`. Send the JSON body in the multipart `request` part.
+
+```shell
+curl -fsS http://127.0.0.1:9931/v1/systemone \
+  -H 'TypeSafe-Danger-Zone-Images: true' \
+  -F 'request={"model":"multimodal","state":["scene","The photo shows the tabletop."],"assets":{"scene":{"type":"image","part":"photo"}},"questions":{"cup":{"type":"box","instructions":"Locate the red cup."}}};type=application/json' \
+  -F 'photo=@tabletop.png;type=image/png'
+```
+
+Use distinct placeholder names such as UUIDs. Still PNG and JPEG images can be 280 to 1568 pixels on each side and up to 16 MiB per file. Image requests and expanded image references have a 32 MiB budget. The effective prompt of each Box question must contain one distinct image. A request can include separate Box questions for different images. A multipart request with only inline assets can carry just the JSON `request` part.
+
+Asset requests default to the TypeSafe response fields and confidence formulas. Choice confidence is measured above the uniform baseline. Score confidence uses the probability-weighted distance from the most likely level, and its legend preserves structured criteria. Noul reports `type` and `noul`. Use `LAYA_JEV_STRICT=1` at server startup to select this response for text requests too. Clients can select `typesafe` or `legacy` with the `X-Laya-Response-Schema` header. Existing `files` and `images` requests default to the legacy response when that setting is unset.
+
+#### POST `/v1/multimodal`
+
+Laya checkpoints also accept one `image`, `video`, or `audio` object with a `base64` string of file bytes, plus `questions` and optional `state`, `max_len`, and `min_confidence`. The server rejects inputs exceeding `max_len` after tokenization. Set `min_confidence` to a number from 0 to 1 or a map with keys such as `choice:3-5` and `default`. The response includes `modality`, `usage.forward_passes`, and `usage.truncated`.
+
+The checkpoint and its matching `--mmproj` determine the media capabilities. For both Qwen3.5-4B v1 and v4, use still images or video frames. Audio requires a checkpoint with an audio encoder.
 
 ## Server tools
 

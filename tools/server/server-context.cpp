@@ -163,6 +163,7 @@ struct server_batch {
         int32_t i_embd = -1; // row in embd, -1 if this is a token
     };
     std::vector<token> tokens;
+    std::vector<int32_t> decision_key_rows;
     int32_t n_tokens_alloc = 0;
     int32_t n_embd = 0;
 
@@ -182,11 +183,14 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt, bool decision_key = false) {
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
         tokens.push_back({ id_slot, token, { pos, 0, 0, 0 }, output, is_prompt });
+        if (decision_key) {
+            decision_key_rows.push_back(size() - 1);
+        }
         return true;
     }
 
@@ -207,6 +211,7 @@ struct server_batch {
 
     void clear() {
         tokens.clear();
+        decision_key_rows.clear();
         embd.clear();
         view.clear();
         slot_batched      = nullptr;
@@ -228,6 +233,7 @@ struct server_batch {
             }
         }
         tokens.resize(n);
+        decision_key_rows.erase(std::lower_bound(decision_key_rows.begin(), decision_key_rows.end(), n), decision_key_rows.end());
     }
 
     void set_output(int32_t idx, bool output) {
@@ -537,7 +543,7 @@ struct server_slot {
         if (pooling == LLAMA_POOLING_TYPE_RANK && llama_get_causal_attn(ctx_tgt)) {
             return true;
         }
-        // a decision task reads its outputs from the last batch
+        // causal decisions can retain prompt state across batches
         if (task->type == SERVER_TASK_TYPE_DECISION) {
             return true;
         }
@@ -1439,6 +1445,10 @@ private:
         }
 
         mtmd_cap = mtmd_helper_get_capabilities(model_tgt, mctx);
+        if (decision.is_laya_multimodal()) {
+            mtmd_cap.chat = false;
+            mtmd_cap.text_gen = false;
+        }
         // the helper only knows about the built-in video decoder
         mtmd_cap.video = mtmd_cap.video || (mtmd_cap.vision && init_opt.video_params.decoder != nullptr);
 
@@ -4025,7 +4035,9 @@ private:
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
                     const bool is_decision = slot.task->type == SERVER_TASK_TYPE_DECISION;
-                    const int32_t n_decision_first = is_decision ? slot.task->decision.pos_first() : -1;
+                    const auto & decision = slot.task->decision;
+                    const int32_t n_decision_first = is_decision ? decision.pos_first() : -1;
+                    const bool single_batch_decision = n_decision_first >= 0 && decision.pointer_dim == 0;
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
@@ -4107,8 +4119,8 @@ private:
                                 return;
                             }
 
-                            // the outputs of a decision are read from one batch
-                            if (n_decision_first >= 0 && slot.task->n_tokens() - n_decision_first > n_batch) {
+                            // heads without candidate key accumulation read their outputs from one batch
+                            if (single_batch_decision && slot.task->n_tokens() - n_decision_first > n_batch) {
                                 send_error(slot,
                                            string_format("the question and its options (%d tokens) are too large to process. "
                                                          "increase the batch size (current batch size: %d)",
@@ -4443,6 +4455,9 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    const auto marker_end = decision.markers.end();
+                    auto marker = decision.pointer_dim > 0 ?
+                        std::lower_bound(decision.markers.begin(), marker_end, slot.prompt.n_tokens()) : marker_end;
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -4457,8 +4472,8 @@ private:
                             break;
                         }
 
-                        // the outputs of a decision are read from one batch, do not split them
-                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
+                        if (single_batch_decision && slot.prompt.n_tokens() == n_decision_first &&
+                                batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
                             break;
                         }
 
@@ -4470,17 +4485,19 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output;
-                        // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_nextn into ctx_dft.
-                        const auto & decision = slot.task->decision;
+                        // Candidate heads only output keys here. The final query is marked below.
+                        const bool decision_key = marker != marker_end && *marker == slot.prompt.n_tokens();
+                        if (decision_key) {
+                            ++marker;
+                        }
                         const bool output = slot.need_embd() && decision.n_values == 0 &&
-                            (decision.pointer_dim == 0 || std::binary_search(decision.markers.begin(), decision.markers.end(), slot.prompt.n_tokens()));
+                            (decision.pointer_dim == 0 || decision_key);
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ output,
-                            /* is_prompt = */ true);
+                            /* is_prompt = */ true,
+                            decision_key);
                         if (!slot.task->decision.order.empty()) {
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
@@ -4604,18 +4621,27 @@ private:
     // returns false on error, the slot is then released
     bool add_prompt_mixed(server_slot & slot) {
         const auto & input_tokens = slot.task->tokens;
+        const auto & decision = slot.task->decision;
         const auto n_tokens_prev = batch.size();
+        const auto marker_end = decision.markers.end();
+        auto marker = decision.pointer_dim > 0 ?
+            std::lower_bound(decision.markers.begin(), marker_end, slot.prompt.n_tokens()) : marker_end;
 
         while (slot.prompt.n_tokens() < slot.task->n_tokens()) {
             const auto cur_token_idx = slot.prompt.n_tokens();
             const llama_token cur_tok = input_tokens[cur_token_idx];
 
             if (cur_tok != LLAMA_TOKEN_NULL) {
+                const bool decision_key = marker != marker_end && *marker == cur_token_idx;
+                if (decision_key) {
+                    ++marker;
+                }
                 const bool add_ok = batch.add(slot.id,
                     cur_tok,
                     /* pos       = */ slot.prompt.tokens.pos_next(),
                     /* output    = */ slot.need_embd(),
-                    /* is_prompt = */ true);
+                    /* is_prompt = */ true,
+                    decision_key);
                 GGML_ASSERT(add_ok);
                 if (!slot.task->decision.order.empty()) {
                     batch.set_decision_order(batch.size() - 1, slot.task->decision.order[cur_token_idx]);
@@ -4816,31 +4842,29 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // An inline image or a batch boundary can separate a candidate from the final query.
+        const auto & key_rows = batch.decision_key_rows;
+        for (auto it = std::lower_bound(key_rows.begin(), key_rows.end(), off); it != key_rows.end() && is_inside_view(*it); ++it) {
+            auto & slot = slots[batch.tokens[*it].id_slot];
+            if (!slot.is_processing()) {
+                continue;
+            }
+            const int32_t dim = slot.task->decision.pointer_dim;
+            const float * embd = llama_get_embeddings_ith(slot.ctx_tgt, *it - off);
+            if (!embd) {
+                send_error(slot, "failed to get decision candidate", ERROR_TYPE_SERVER);
+                slot.release();
+                slot.i_batch = -1;
+                continue;
+            }
+            slot.decision_keys.insert(slot.decision_keys.end(), embd + dim, embd + 2 * dim);
+        }
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
-                }
-            }
-
-            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->decision.pointer_dim > 0) {
-                // A KV cache retry can split a batch before the final query token.
-                const auto & decision = slot.task->decision;
-                const int32_t dim = decision.pointer_dim;
-                for (size_t i = slot.decision_keys.size() / dim; i < decision.markers.size(); i++) {
-                    const int32_t row = slot.i_batch - off - (slot.task->n_tokens() - 1 - decision.markers[i]);
-                    if (row >= n_batch_tokens) {
-                        break;
-                    }
-                    const float * embd = row >= 0 ? llama_get_embeddings_ith(slot.ctx_tgt, row) : nullptr;
-                    if (!embd) {
-                        send_error(slot, "failed to get decision candidate", ERROR_TYPE_SERVER);
-                        slot.release();
-                        slot.i_batch = -1;
-                        return;
-                    }
-                    slot.decision_keys.insert(slot.decision_keys.end(), embd + dim, embd + 2 * dim);
                 }
             }
 
@@ -6545,7 +6569,7 @@ void server_routes::init_routes() {
         return handle_tts_impl(req, std::move(body));
     };
 
-    this->post_systemone = [this](const server_http_req & req) {
+    const auto post_decision = [this](const server_http_req & req, bool native_media) {
         auto res = create_response();
         const auto & decision = ctx_server.decision;
         if (decision.type == COMMON_DECISION_TYPE_NONE) {
@@ -6553,27 +6577,69 @@ void server_routes::init_routes() {
             return res;
         }
 
-        const json body = json::parse(req.body);
+        json body = server_decision_request_json(req, native_media);
+        if (body.contains("assets") && !body.at("assets").is_object()) {
+            throw std::invalid_argument("assets must be a JSON object");
+        }
+        if (native_media && body.contains("assets")) {
+            throw std::invalid_argument("send image assets to /v1/systemone");
+        }
+        const bool has_assets = body.contains("assets") && !body.at("assets").empty();
+        if ((has_assets || native_media) && !decision.is_laya_multimodal()) {
+            res->error(format_error_response("This endpoint requires a Laya multimodal decision model", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (has_assets && !meta->has_inp_image) {
+            res->error(format_error_response("Image assets require a model loaded with --mmproj", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const bool typesafe_response = server_decision_typesafe_response(req, has_assets, native_media);
+        const json original_questions = typesafe_response && body.contains("questions") ? body.at("questions") : json();
+        const json min_confidence = native_media ? body.value("min_confidence", json()) : json();
+        server_decision_validate_confidence(min_confidence);
         if (body.contains("cache_prompt") && !body.at("cache_prompt").is_boolean()) {
             throw std::invalid_argument("cache_prompt must be a boolean");
         }
         const bool cache_prompt = body.value("cache_prompt", params.cache_prompt);
+        auto media_options = ctx_server.init_opt;
+        decision.configure_media(media_options);
+        server_decision_assets assets;
+        std::vector<raw_buffer> files;
+        std::string declared_modality;
+        if (has_assets) {
+            assets = server_decision_bind_assets(req, body, files, media_options);
+        } else if (native_media) {
+            declared_modality = server_decision_read_media(body, files);
+            if ((declared_modality == "audio" && !meta->has_inp_audio) ||
+                (declared_modality == "video" && !meta->has_inp_video) ||
+                (declared_modality == "image" && !meta->has_inp_image)) {
+                res->error(format_error_response("This model does not support the requested media type", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+        }
         const auto questions = decision.parse_questions(body, meta->has_inp_audio);
         const size_t set_size = decision.set_size(questions);
-
-        std::vector<raw_buffer> files;
-        const json state = decision.prepare_state(decision.parse_state(body, files));
-        if (!files.empty() && (!decision.can_use_images() || !meta->has_inp_image)) {
+        const json state = decision.prepare_state(has_assets || native_media ? body.value("state", json()) : decision.parse_state(body, files));
+        if (!native_media && !files.empty() && (!decision.can_use_images() || !meta->has_inp_image)) {
             res->error(format_error_response("This server does not support image input for decisions. For a model that supports it, start it with `--mmproj`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-        auto media_options = ctx_server.init_opt;
-        decision.configure_media(media_options);
-        const std::string modality = decision.input_modality(state, files, ctx_server.mctx, media_options);
-        if (std::any_of(questions.begin(), questions.end(), [](const auto & q) { return q.type == SERVER_DECISION_QUESTION_BOX; }) &&
+        const std::string modality = has_assets ? "image" : decision.input_modality(state, files, ctx_server.mctx, media_options);
+        if (native_media && declared_modality != modality) {
+            throw std::invalid_argument("media bytes do not match the declared type");
+        }
+        if (!has_assets && std::any_of(questions.begin(), questions.end(), [](const auto & q) { return q.type == SERVER_DECISION_QUESTION_BOX; }) &&
             (files.size() != 1 || modality != "image")) {
             throw std::invalid_argument("Box requires exactly one image");
         }
+        size_t request_max_len = 0;
+        if (native_media && body.contains("max_len") && !body.at("max_len").is_null()) {
+            if (!body.at("max_len").is_number_integer() || body.at("max_len").get<int64_t>() <= 0) {
+                throw std::invalid_argument("max_len must be a positive integer");
+            }
+            request_max_len = body.at("max_len").get<size_t>();
+        }
+        std::vector<std::string> question_modalities(questions.size(), modality);
 
         // one task per variant of each question, or one task for all the questions, or per packed set
         const bool is_packed = decision.is_joint() || set_size > 0;
@@ -6595,11 +6661,18 @@ void server_routes::init_routes() {
                     tasks.push_back(std::move(task));
                 }
             } else {
-                for (const auto & question : questions) {
+                for (size_t i = 0; i < questions.size(); ++i) {
+                    const auto & question = questions[i];
                     for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
                         server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                         task.id = rd.get_new_id();
-                        decision.fill_task(state, questions, question, variant, media, task);
+                        decision.fill_task(state, questions, question, variant, media, task, has_assets ? &assets : nullptr);
+                        if (has_assets) {
+                            question_modalities[i] = task.tokens.has_mtmd ? "image" : "text";
+                        }
+                        if (request_max_len && task.tokens.size() > request_max_len) {
+                            throw std::invalid_argument("multimodal input exceeds max_len");
+                        }
                         tasks.push_back(std::move(task));
                     }
                 }
@@ -6626,7 +6699,8 @@ void server_routes::init_routes() {
         int32_t n_tokens = 0;
         size_t i_result = 0;
         size_t i_score  = 0;
-        for (const auto & question : questions) {
+        for (size_t i = 0; i < questions.size(); ++i) {
+            const auto & question = questions[i];
             std::vector<std::vector<float>> scores;
             if (is_packed) {
                 auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[i_result].get());
@@ -6647,18 +6721,34 @@ void server_routes::init_routes() {
                 scores.push_back(result->scores);
                 n_tokens += result->n_tokens;
             }
-            answers[question.id] = decision.format_answer(question, scores, modality);
+            answers[question.id] = decision.format_answer(question, scores, question_modalities[i],
+                    typesafe_response ? &original_questions.at(question.id) : nullptr);
+            server_decision_apply_confidence(answers[question.id], min_confidence);
         }
 
-        res->ok(json{
+        json response = {
             {"model",   meta->model_name},
             {"answers", answers},
             {"usage",   {
                 {"input_tokens",  n_tokens},
                 {"output_tokens", 0},
             }},
-        });
+        };
+        if (native_media) {
+            response["usage"]["forward_passes"] = questions.size();
+            response["usage"]["truncated"] = false;
+            response["modality"] = modality;
+        }
+        res->ok(response);
         return res;
+    };
+
+    this->post_systemone = [post_decision](const server_http_req & req) {
+        return post_decision(req, false);
+    };
+
+    this->post_multimodal = [post_decision](const server_http_req & req) {
+        return post_decision(req, true);
     };
 
     this->get_lora_adapters = [this](const server_http_req & req) {

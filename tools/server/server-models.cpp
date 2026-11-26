@@ -2,6 +2,7 @@
 #include "http.h"
 #include "server-models.h"
 #include "server-context.h"
+#include "server-decision.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -2162,9 +2163,7 @@ void server_models_routes::init_routes() {
         models.proxy_ws(req, conn, name);
     };
 
-    this->proxy_post = [this](const server_http_req & req) {
-        std::string method = "POST";
-        json body = json::parse(req.body);
+    const auto proxy_post_json = [this](const server_http_req & req, const json & body) {
         std::string name = json_value(body, "model", std::string());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
@@ -2190,7 +2189,25 @@ void server_models_routes::init_routes() {
         // a session request that waited for a load detaches from the client socket: the
         // client may have dropped during the wait (page reload) and the session buffer must
         // still receive the generation for a later resume
-        return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
+        return models.proxy_request(req, "POST", name, true, waited && ticket != 0); // update last usage for POST request only
+    };
+
+    this->proxy_post = [proxy_post_json](const server_http_req & req) {
+        return proxy_post_json(req, json::parse(req.body));
+    };
+
+    this->proxy_post_systemone = [proxy_post_json](const server_http_req & req) {
+        const auto body = server_decision_request_json(req);
+        if (req.multipart && req.files.empty()) {
+            // Inline assets can be forwarded as JSON when the envelope has no file parts.
+            const server_http_req forwarded = { req.params, req.headers, req.path, req.query_string, body.dump(), {}, req.should_stop };
+            return proxy_post_json(forwarded, body);
+        }
+        return proxy_post_json(req, body);
+    };
+
+    this->proxy_post_multimodal = [proxy_post_json](const server_http_req & req) {
+        return proxy_post_json(req, server_decision_request_json(req, true));
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {
@@ -2767,23 +2784,24 @@ server_http_proxy::server_http_proxy(
 
     // when files are present, the body was converted from multipart form data to JSON
     // we need to reconstruct the multipart body for the downstream server
-    std::string effective_body = body;
+    httplib::Request req;
     std::string override_content_type;
-    bool has_files = !files.empty();
+    const bool has_files = !files.empty();
 
     if (has_files) {
         json form_fields = json::parse_no_throw(body);
         if (!form_fields.is_discarded()) {
             auto boundary = generate_multipart_boundary();
-            effective_body = build_multipart_body(form_fields, files, boundary);
+            req.body = build_multipart_body(form_fields, files, boundary);
             override_content_type = "multipart/form-data; boundary=" + boundary;
         } else {
             throw std::runtime_error("failed to parse multipart form fields JSON");
         }
+    } else {
+        req.body = body;
     }
 
     // prepare the request to destination server
-    httplib::Request req;
     {
         req.method = method;
         req.path = path;
@@ -2808,7 +2826,7 @@ server_http_proxy::server_http_proxy(
                 }
                 // when no files but the original request was multipart,
                 // the body is now JSON, so correct the Content-Type
-                if (value.find("multipart/form-data") != std::string::npos) {
+                if (to_lower_copy(value).find("multipart/form-data") != std::string::npos) {
                     override_content_type = "application/json; charset=utf-8";
                     continue;
                 }
@@ -2821,7 +2839,6 @@ server_http_proxy::server_http_proxy(
                 req.set_header(key, value);
             }
         }
-        req.body = effective_body;
         if (!override_content_type.empty()) {
             req.set_header("Content-Type", override_content_type);
         }
@@ -2831,16 +2848,18 @@ server_http_proxy::server_http_proxy(
 
     // start the proxy thread
     SRV_DBG("start proxy thread %s %s\n", req.method.c_str(), req.path.c_str());
-    this->thread = std::thread([cli, pipe, req, headers_sent, make_header_msg]() {
-        auto result = cli->send(std::move(req));
-        if (result.error() != httplib::Error::Success) {
-            auto err_str = httplib::to_string(result.error());
+    this->thread = std::thread([cli, pipe, req = std::move(req), headers_sent, make_header_msg]() mutable {
+        httplib::Response response;
+        httplib::Error error = httplib::Error::Success;
+        const bool sent = cli->send(req, response, error);
+        if (!sent || error != httplib::Error::Success) {
+            auto err_str = httplib::to_string(error);
             SRV_ERR("http client error: %s\n", err_str.c_str());
             pipe->write({{}, 500, "", ""}); // header
             pipe->write({{}, 0, "proxy error: " + err_str, ""}); // body
         } else if (!headers_sent->load()) {
             // httplib skips response_handler for bodyless statuses like 204, send headers here instead
-            pipe->write(make_header_msg(*result));
+            pipe->write(make_header_msg(response));
         }
         pipe->close_write(); // signal EOF to reader
         SRV_DBG("%s", "client request thread ended\n");

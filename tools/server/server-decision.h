@@ -9,6 +9,23 @@
 #include <string>
 #include <vector>
 
+struct server_http_req;
+
+struct server_decision_assets {
+    std::string marker;
+    std::vector<size_t> prefix_order;
+
+    std::vector<size_t> resolve(std::string & text, std::vector<std::pair<size_t, size_t>> & spans) const;
+};
+
+json server_decision_request_json(const server_http_req & req, bool native_media = false);
+bool server_decision_typesafe_response(const server_http_req & req, bool has_assets, bool native_media);
+server_decision_assets server_decision_bind_assets(const server_http_req & req, json & body,
+        std::vector<raw_buffer> & files, const mtmd_helper_init_opt & options);
+std::string server_decision_read_media(const json & body, std::vector<raw_buffer> & files);
+void server_decision_validate_confidence(const json & limit);
+void server_decision_apply_confidence(json & answer, const json & limit);
+
 // typed decision models (TypeSafe /v1/systemone API)
 // the model answers each question in one forward pass, no token is generated
 
@@ -123,7 +140,8 @@ struct server_decision_context {
             const server_decision_question & question,
             size_t variant,
             server_mtmd_input & input,
-            server_task & task) const;
+            server_task & task,
+            const server_decision_assets * assets = nullptr) const;
 
     // set the prompt of all the questions, the result has the scores of all their options, in order
     void fill_task_joint(
@@ -143,7 +161,8 @@ struct server_decision_context {
             server_task & task) const;
 
     // scores: the raw model outputs of each variant
-    json format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores, const std::string & modality = "text") const;
+    json format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores,
+            const std::string & modality = "text", const json * typesafe_question = nullptr) const;
 
 private:
     const llama_vocab * vocab = nullptr;
@@ -204,7 +223,7 @@ private:
     std::string d1_break(const std::string & text) const;
     void fill_task_laya(llama_tokens & tokens, const server_decision_question & question, server_task & task) const;
     void fill_task_laya_multimodal(const json & state, const server_decision_question & question,
-            server_mtmd_input & input, server_task & task) const;
+            server_mtmd_input & input, server_task & task, const server_decision_assets * assets) const;
     void fill_task_d1omni(
             const json & state,
             const std::vector<server_decision_question> & questions,

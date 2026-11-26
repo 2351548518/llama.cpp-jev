@@ -3,6 +3,7 @@
 #include "../tools/server/server-chat.h"
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../tools/server/server-http.h"
 #include "../tools/server/server-schema.h"
 #include "../tools/server/server-slot-sched.h"
 
@@ -700,6 +701,84 @@ static void test_decision_laya_box(testing & t) {
     t.assert_true("nonfinite Box result is rejected", rejected);
 }
 
+static void test_decision_typesafe_request(testing & t) {
+    const std::function<bool()> connected = [] { return false; };
+    const std::string png =
+        "iVBORw0KGgoAAAANSUhEUgAAARgAAAEYAQAAAACv9dQhAAAAIElEQVR42u3BMQEAAADCoPVP7W8GoAAAAAAAAAAAAIA3J2AAAdzYCbkAAAAASUVORK5CYII=";
+    const json image = {{"type", "image"}, {"format", "png"}, {"data_base64", png}};
+    const json question = {{"type", "box"}, {"instructions", "the square"}};
+    const json request = {
+        {"model", "laya"},
+        {"state", json::array({"photo", "Scene shown"})},
+        {"questions", {{"q", question}}},
+        {"assets", {{"photo", image}}},
+    };
+    server_http_req req = {{}, {{"typesafe-danger-zone-images", "true"}}, "/v1/systemone", "", request.dump(), {}, connected};
+
+    auto body = server_decision_request_json(req);
+    std::vector<raw_buffer> files;
+    auto assets = server_decision_bind_assets(req, body, files, mtmd_helper_init_opt_default());
+    t.assert_true("prefix keeps image and text in state order", assets.prefix_order == std::vector<size_t>{0} &&
+            body.at("state") == "Scene shown" && files.size() == 1 && files[0].size() == 89);
+    t.assert_true("image requests default to TypeSafe", server_decision_typesafe_response(req, true, false));
+    req.headers["X-Laya-Response-Schema"] = "legacy";
+    t.assert_true("connection can keep legacy response", !server_decision_typesafe_response(req, true, false));
+
+    const json multipart = {{"request", request.dump()}};
+    req.body = multipart.dump();
+    req.multipart = true;
+    body = server_decision_request_json(req);
+    t.assert_true("multipart envelope selects the actual model", body == request);
+    const auto envelope = request.dump();
+    req.body = "{}";
+    req.files["request"] = {raw_buffer(envelope.begin(), envelope.end()), "request.json", "Application/JSON; charset=utf-8"};
+    body = server_decision_request_json(req);
+    t.assert_true("multipart JSON file accepts media type parameters", body == request);
+    req.headers.erase("typesafe-danger-zone-images");
+    bool rejected = false;
+    try {
+        files.clear();
+        server_decision_bind_assets(req, body, files, mtmd_helper_init_opt_default());
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    t.assert_true("missing image opt-in is rejected", rejected);
+
+    assets.prefix_order.clear();
+    std::string prompt = assets.marker + "1> first -> " + assets.marker + "0> second -> ";
+    const size_t first = prompt.find(" ->");
+    const size_t second = prompt.rfind(" ->");
+    std::vector<std::pair<size_t, size_t>> spans = {{first, first + 3}, {second, second + 3}};
+    const auto order = assets.resolve(prompt, spans);
+    t.assert_true("asset order follows the prompt", order == std::vector<size_t>{1, 0});
+    t.assert_true("candidate spans follow media replacements", spans[0].first == prompt.find(" ->") &&
+            spans[1].first == prompt.rfind(" ->") && spans[0].second == spans[0].first + 3);
+}
+
+static void test_decision_typesafe_confidence(testing & t) {
+    server_decision_context ctx;
+    ctx.type = COMMON_DECISION_TYPE_VLLM_D3;
+    const json structured = {{"level", "middle"}};
+    const json request = {{"criteria", json::array({"low", structured, "high"})}};
+    const server_decision_question score = {"q", SERVER_DECISION_QUESTION_SCORE, "rating",
+        {{"0", "low"}, {"1", "middle"}, {"2", "high"}}};
+    const auto legacy = ctx.format_answer(score, {{0.0f, 3.0f, 1.0f}});
+    const auto strict = ctx.format_answer(score, {{0.0f, 3.0f, 1.0f}}, "text", &request);
+    const auto & p = strict.at("probabilities");
+    const double expected = 1.0 - (p.at("0").get<double>() + p.at("2").get<double>()) / (2.0 / 3.0);
+    t.assert_true("TypeSafe uses the mode distance and structured legend", strict.at("legend").at("1") == structured &&
+            std::fabs(strict.at("confidence").get<double>() - expected) < 1e-10);
+    t.assert_true("legacy entropy confidence and legend are preserved", legacy.at("confidence") != strict.at("confidence") &&
+            legacy.at("legend").at("1") == "middle" && legacy.at("probabilities") == p);
+    auto gated = strict;
+    const json thresholds = {{"score:3-5", 1.0}, {"default", 0.0}};
+    server_decision_validate_confidence(thresholds);
+    server_decision_apply_confidence(gated, thresholds);
+    t.assert_true("confidence gate uses the option-count bucket", gated.at("abstention") == "abstained" &&
+            gated.at("abstention_threshold") == 1.0 && gated.at("low_confidence") == true &&
+            gated.at("probabilities") == p);
+}
+
 //
 // server_decision_context::parse_questions / parse_state, the request checks of minicpm-ocr-jev
 //
@@ -989,6 +1068,8 @@ int main(int argc, char ** argv) {
     t.test("rerank_template", test_rerank_template);
     t.test("decision_class_scores", test_decision_class_scores);
     t.test("decision_laya_box", test_decision_laya_box);
+    t.test("decision_typesafe_request", test_decision_typesafe_request);
+    t.test("decision_typesafe_confidence", test_decision_typesafe_confidence);
     t.test("decision_ocr_jev_validation", test_decision_ocr_jev_validation);
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);

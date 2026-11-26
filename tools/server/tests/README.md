@@ -100,6 +100,8 @@ To run a single test:
 ./tests.sh unit/test_chat_completion.py::test_invalid_chat_completion_req
 ```
 
+Run local GGUF regression tests from this directory with `python -m pytest unit/test_local_gguf.py`. Set `LLAMA_LAYA_GGUF` and `LLAMA_LAYA_MMPROJ` for the direct and routed decision tests. Set `LLAMA_QWEN35_GGUF` or `LLAMA_GEMMA4_GGUF` for ordinary chat tests. Use local file paths. These tests skip missing fixtures and run offline. To check another backend, point `LLAMA_SERVER_BIN_PATH` at its server binary and set `N_GPU_LAYERS=99` for GPU offload.
+
 Hint: You can compile and run test in single command, useful for local development:
 
 ```shell

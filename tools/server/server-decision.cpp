@@ -358,8 +358,8 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
             if (!laya_box) {
                 throw err("this checkpoint has no trained Box head");
             }
-            if (q.size() != 2 || !instructions.is_string() || string_strip(instructions.get<std::string>()).empty()) {
-                throw err("Box takes only type and nonempty text instructions");
+            if (q.size() != 2 || !decision_is_payload(instructions)) {
+                throw err("Box takes only type and nonempty instructions");
             }
             question.type = SERVER_DECISION_QUESTION_BOX;
         } else if (type_name == "choice") {
@@ -1391,10 +1391,11 @@ void server_decision_context::fill_task(
         const server_decision_question & question,
         size_t variant,
         server_mtmd_input & input,
-        server_task & task) const {
+        server_task & task,
+        const server_decision_assets * assets) const {
     const auto & files = input.files;
     if (is_laya_multimodal()) {
-        fill_task_laya_multimodal(state, question, input, task);
+        fill_task_laya_multimodal(state, question, input, task, assets);
         return;
     }
     // each question has its own prompt, with the spans that the head reads
@@ -1540,7 +1541,8 @@ static bool decision_laya_option_code(const std::string & key) {
 }
 
 void server_decision_context::fill_task_laya_multimodal(
-        const json & state, const server_decision_question & question, server_mtmd_input & input, server_task & task) const {
+        const json & state, const server_decision_question & question, server_mtmd_input & input, server_task & task,
+        const server_decision_assets * assets) const {
     const bool is_box = question.type == SERVER_DECISION_QUESTION_BOX;
     const bool prompt_v2 = laya_config.value("prompt_version", std::string("v1")) == "v2";
     const bool state_first = is_box || laya_candidate || prompt_v2;
@@ -1603,9 +1605,19 @@ void server_decision_context::fill_task_laya_multimodal(
     if (!input.files.empty() && text.find(marker) != std::string::npos) {
         throw std::invalid_argument("Laya text contains the reserved media marker");
     }
-    const json images = std::vector<std::string>(input.files.size(), marker);
+    std::vector<size_t> image_order;
+    const bool inline_assets = assets && assets->prefix_order.empty();
+    if (assets) {
+        image_order = inline_assets ? assets->resolve(text, spans) : assets->prefix_order;
+        if (is_box && (image_order.empty() ||
+                std::any_of(image_order.begin(), image_order.end(), [&](size_t index) { return index != image_order.front(); }))) {
+            throw std::invalid_argument("each Box question must reference a single image");
+        }
+    }
+    const size_t prefix_images = assets ? assets->prefix_order.size() : input.files.size();
+    const json images = std::vector<std::string>(prefix_images, marker);
     const std::string prompt = decision_apply_template(*tmpl, {{"images", images}, {"prompt", text}});
-    task.tokens = input.tokenize(prompt, laya_config.value("add_special", false));
+    task.tokens = input.tokenize(prompt, laya_config.value("add_special", false), assets ? &image_order : nullptr);
     if (task.tokens.empty() || task.tokens.size() > laya_config.at("max_len").get<size_t>()) {
         throw std::invalid_argument("Laya input exceeds the checkpoint's token budget");
     }
@@ -1620,25 +1632,56 @@ void server_decision_context::fill_task_laya_multimodal(
     if (start == std::string::npos) {
         throw std::runtime_error("Laya chat template changed the candidate text");
     }
-    // The candidate suffix is text even when media before it expand to many tokens.
-    size_t offset = prompt.size();
     size_t remaining = spans.size();
     task.decision.markers.resize(remaining);
-    for (size_t i = task.tokens.size(); i > 0 && remaining > 0; i--) {
-        if (task.tokens[i - 1] == LLAMA_TOKEN_NULL) {
-            break;
+    auto locate = [&](size_t first, size_t stop, size_t offset) {
+        for (size_t i = stop; i > first && remaining > 0; --i) {
+            if (task.tokens[i - 1] == LLAMA_TOKEN_NULL) {
+                break;
+            }
+            const auto piece = common_token_to_piece(vocab, task.tokens[i - 1], true);
+            const size_t end = offset;
+            if (piece.size() > offset || prompt.compare(offset - piece.size(), piece.size(), piece) != 0) {
+                break;
+            }
+            offset -= piece.size();
+            const auto & span = spans[remaining - 1];
+            if (offset >= start + span.first && end <= start + span.second && offset != end) {
+                task.decision.markers[--remaining] = i - 1;
+            } else if (offset < start + span.first) {
+                break;
+            }
         }
-        const auto piece = common_token_to_piece(vocab, task.tokens[i - 1], true);
-        const size_t end = offset;
-        if (piece.size() > offset || prompt.compare(offset - piece.size(), piece.size(), piece) != 0) {
-            break;
+    };
+    locate(0, task.tokens.size(), prompt.size());
+    if (remaining > 0 && inline_assets && !image_order.empty()) {
+        // Match text between still images. mtmd inserts vision boundary tokens with no bytes in prompt.
+        std::vector<std::pair<size_t, size_t>> segments;
+        size_t first = 0;
+        for (size_t pos = prompt.find(marker); pos != std::string::npos; pos = prompt.find(marker, first)) {
+            segments.emplace_back(first, pos);
+            first = pos + marker.size();
         }
-        offset -= piece.size();
-        const auto & span = spans[remaining - 1];
-        if (offset >= start + span.first && end <= start + span.second && offset != end) {
-            task.decision.markers[--remaining] = i - 1;
-        } else if (offset < start + span.first) {
-            break;
+        segments.emplace_back(first, prompt.size());
+        llama_tokens tokens;
+        tokens.reserve(task.tokens.size());
+        for (size_t i = 0; i < task.tokens.size(); ++i) {
+            tokens.push_back(task.tokens[i]);
+        }
+        auto stop = tokens.end();
+        for (auto it = segments.rbegin(); it != segments.rend() && remaining > 0; ++it) {
+            const auto [begin, end] = *it;
+            const auto expected = common_tokenize(vocab, prompt.substr(begin, end - begin), false, true);
+            if (expected.empty()) {
+                continue;
+            }
+            const auto match = std::find_end(tokens.begin(), stop, expected.begin(), expected.end());
+            if (match == stop) {
+                break;
+            }
+            const size_t offset = match - tokens.begin();
+            locate(offset, offset + expected.size(), end);
+            stop = match;
         }
     }
     if (remaining != 0) {
@@ -2105,7 +2148,8 @@ static void decision_laya_ordinal(std::vector<double> & probs, const json & prof
 }
 
 json server_decision_context::format_answer(
-        const server_decision_question & question, const std::vector<std::vector<float>> & scores, const std::string & modality) const {
+        const server_decision_question & question, const std::vector<std::vector<float>> & scores,
+        const std::string & modality, const json * typesafe_question) const {
     const size_t n = n_outputs(question);
     if (scores.size() != n_variants(question)) {
         throw std::runtime_error("decision result does not match the number of variants");
@@ -2192,12 +2236,14 @@ json server_decision_context::format_answer(
         if (!std::all_of(probs.begin(), probs.end(), [](double p) { return std::isfinite(p); })) {
             throw std::runtime_error("nonfinite Laya decision probabilities");
         }
-        answer["calibrated"] = calibrated;
-        answer["answer_confidence"] = *std::max_element(probs.begin(), probs.end());
+        if (!typesafe_question) {
+            answer["calibrated"] = calibrated;
+            answer["answer_confidence"] = *std::max_element(probs.begin(), probs.end());
+        }
     }
 
     if (question.type == SERVER_DECISION_QUESTION_NOUL) {
-        if (is_laya_multimodal()) {
+        if (is_laya_multimodal() && !typesafe_question) {
             answer["confidence"] = answer.at("answer_confidence");
         }
         if (type == COMMON_DECISION_TYPE_LEV) {
@@ -2226,18 +2272,19 @@ json server_decision_context::format_answer(
         const auto & opt = question.options[best];
         answer["choice"]        = opt.label.is_null() ? json(opt.key) : opt.label;
         answer["probabilities"] = probabilities;
-        answer["confidence"]    = get_decision_confidence(question.type, probs);
+        answer["confidence"]    = typesafe_question ? decision_confidence_choice(probs) : get_decision_confidence(question.type, probs);
     } else {
         double expected = 0.0;
         json legend = json::object();
         for (size_t i = 0; i < n; i++) {
             expected += i * probs[i];
             const json & description = question.options[i].description;
-            legend[question.options[i].key] = is_laya_multimodal() ? json(decision_laya_text(description)) :
+            legend[question.options[i].key] = typesafe_question ? typesafe_question->at("criteria").at(i) :
+                is_laya_multimodal() ? json(decision_laya_text(description)) :
                 canonical_legend && !description.is_string() ? json(decision_sort_keys(description).dump()) : description;
         }
         // lfm3-d1: the median level, the first whose cumulative probability reaches one half (d1 api.py)
-        if (is_lfm3_d1()) {
+        if (is_lfm3_d1() && !typesafe_question) {
             double mass = 0.0;
             size_t level = n - 1;
             for (size_t i = 0; i < n && mass < 0.5; i++) {
@@ -2249,7 +2296,7 @@ json server_decision_context::format_answer(
         answer["score"]         = expected;
         answer["legend"]        = legend;
         answer["probabilities"] = probabilities;
-        answer["confidence"]    = get_decision_confidence(question.type, probs);
+        answer["confidence"]    = typesafe_question ? decision_confidence_score(probs) : get_decision_confidence(question.type, probs);
     }
     return answer;
 }
