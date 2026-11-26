@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <numeric>
@@ -15,6 +16,9 @@
 
 static constexpr size_t MAX_ASSET_REQUEST_BYTES = 32 * 1024 * 1024;
 static constexpr size_t MAX_ASSET_IMAGE_BYTES = 16 * 1024 * 1024;
+static constexpr size_t MAX_DECISION_QUESTIONS = 64;
+static constexpr size_t MAX_DECISION_OPTIONS = 512;
+static constexpr size_t MAX_DECISION_INPUT_TOKENS = 64 * 1024;
 static constexpr uint32_t MIN_ASSET_SIDE = 280;
 static constexpr uint32_t MAX_ASSET_SIDE = 1568;
 static constexpr int MAX_ASSET_DEPTH = 128;
@@ -39,6 +43,37 @@ static bool images_enabled(const server_http_req & req) {
 
 static std::string media_type(const std::string & content_type) {
     return lower_ascii(string_strip(content_type.substr(0, content_type.find(';'))));
+}
+
+void server_decision_check_request_limits(const json & body) {
+    if (!body.contains("questions") || !body.at("questions").is_object() || body.at("questions").empty()) {
+        throw std::invalid_argument("questions must be a non-empty object");
+    }
+    const auto & questions = body.at("questions");
+    if (questions.size() > MAX_DECISION_QUESTIONS) {
+        throw std::invalid_argument("Laya decisions accept at most 64 questions per request");
+    }
+    size_t options = 0;
+    for (const auto & question : questions) {
+        if (!question.is_object() || !question.contains("criteria")) {
+            continue;
+        }
+        const auto type = json_value(question, "type", std::string());
+        const auto & criteria = question.at("criteria");
+        if ((type == "choice" || type == "score") && (criteria.is_array() || criteria.is_object())) {
+            if (criteria.size() > MAX_DECISION_OPTIONS - options) {
+                throw std::invalid_argument("Laya decisions accept at most 512 choice options and score levels per request");
+            }
+            options += criteria.size();
+        }
+    }
+}
+
+void server_decision_add_input_tokens(size_t & total, size_t tokens) {
+    if (total > MAX_DECISION_INPUT_TOKENS || tokens > MAX_DECISION_INPUT_TOKENS - total) {
+        throw std::invalid_argument("Laya decision input exceeds 65536 tokens across questions");
+    }
+    total += tokens;
 }
 
 json server_decision_request_json(const server_http_req & req, bool native_media) {
@@ -73,6 +108,9 @@ json server_decision_request_json(const server_http_req & req, bool native_media
         if (!body.is_object() || !body.contains("assets") || !body.at("assets").is_object() || body.at("assets").empty()) {
             throw std::invalid_argument("multipart System One requests need image assets");
         }
+    }
+    if (native_media || (body.contains("assets") && body.at("assets").is_object() && !body.at("assets").empty())) {
+        server_decision_check_request_limits(body);
     }
     return body;
 }
@@ -224,6 +262,70 @@ static size_t asset_pixels(const raw_buffer & data, const std::string & format, 
     return size_t(meta.width) * meta.height * 3;
 }
 
+static const json * state_field(const json & state, std::string_view path) {
+    if (path.empty()) {
+        return nullptr;
+    }
+    const json * value = &state;
+    while (!path.empty()) {
+        if (value->is_object()) {
+            const size_t length = std::min(path.size(), path.find_first_of(".["));
+            const std::string field(path.substr(0, length));
+            if (field.empty() || !value->contains(field)) {
+                return nullptr;
+            }
+            value = &value->at(field);
+            path.remove_prefix(length);
+        } else if (value->is_array() && path.front() == '[') {
+            const size_t end = path.find(']');
+            if (end == std::string_view::npos) {
+                return nullptr;
+            }
+            size_t index = 0;
+            const char * stop = path.data() + end;
+            const auto parsed = std::from_chars(path.data() + 1, stop, index);
+            if (parsed.ec != std::errc() || parsed.ptr != stop || index >= value->size()) {
+                return nullptr;
+            }
+            value = &value->at(index);
+            path.remove_prefix(end + 1);
+        } else {
+            return nullptr;
+        }
+        if (!path.empty() && path.front() == '.') {
+            path.remove_prefix(1);
+            if (path.empty() || path.front() == '[') {
+                return nullptr;
+            }
+        } else if (!path.empty() && path.front() != '[') {
+            return nullptr;
+        }
+    }
+    return value;
+}
+
+static void find_box_image(const json & state, std::string_view instructions, const server_decision_assets & assets,
+        std::optional<size_t> & selected) {
+    for (size_t start = instructions.find('`'); start != std::string_view::npos;) {
+        const size_t end = instructions.find('`', start + 1);
+        if (end == std::string_view::npos) {
+            break;
+        }
+        const auto * field = state_field(state, instructions.substr(start + 1, end - start - 1));
+        if (field && field->is_string()) {
+            std::string value = field->get<std::string>();
+            std::vector<std::pair<size_t, size_t>> spans;
+            for (const size_t index : assets.resolve(value, spans)) {
+                if (selected && *selected != index) {
+                    throw std::invalid_argument("Box instructions must name one target image path");
+                }
+                selected = index;
+            }
+        }
+        start = instructions.find('`', end + 1);
+    }
+}
+
 server_decision_assets server_decision_bind_assets(const server_http_req & req, json & body,
         std::vector<raw_buffer> & files, const mtmd_helper_init_opt & options) {
     if (!images_enabled(req)) {
@@ -236,7 +338,8 @@ server_decision_assets server_decision_bind_assets(const server_http_req & req, 
         throw std::invalid_argument("image assets need state and a questions object");
     }
 
-    server_decision_assets assets = { "<__laya_asset_" + random_string() + "_", {} };
+    server_decision_assets assets;
+    assets.marker = "<__laya_asset_" + random_string() + "_";
     std::vector<std::string> names;
     std::vector<size_t> pixels;
     std::set<std::string> used_parts;
@@ -307,14 +410,14 @@ server_decision_assets server_decision_bind_assets(const server_http_req & req, 
 
     size_t expanded_bytes = 0;
     std::vector<bool> used(names.size());
-    auto bind = [&](auto && self, json & value, int depth) -> bool {
+    auto bind = [&](auto && self, json & value, int depth, std::optional<size_t> * target) -> bool {
         if (depth >= MAX_ASSET_DEPTH) {
             throw std::invalid_argument("image references are nested too deeply");
         }
         if (value.is_array() || value.is_object()) {
             bool changed = false;
             for (auto & item : value) {
-                changed |= self(self, item, depth + 1);
+                changed |= self(self, item, depth + 1, target);
             }
             return changed;
         }
@@ -324,6 +427,9 @@ server_decision_assets server_decision_bind_assets(const server_http_req & req, 
         const std::string text = value.get<std::string>();
         if (text.find(get_media_marker()) != std::string::npos || text.find(assets.marker) != std::string::npos) {
             throw std::invalid_argument("text contains a reserved media marker");
+        }
+        if (target) {
+            find_box_image(state, text, assets, *target);
         }
         std::string rendered;
         size_t offset = 0;
@@ -356,17 +462,23 @@ server_decision_assets server_decision_bind_assets(const server_http_req & req, 
         value = std::move(rendered);
         return true;
     };
-    bind(bind, state, 0);
+    bind(bind, state, 0, nullptr);
     bool questions_changed = false;
-    for (auto & question : body.at("questions")) {
-        if (question.is_object() && json_value(question, "type", std::string()) == "choice" &&
+    for (auto [id, question] : body.at("questions").items()) {
+        const auto type = question.is_object() ? json_value(question, "type", std::string()) : std::string();
+        if (type == "choice" &&
             question.contains("criteria") && !question.at("criteria").is_object()) {
             throw std::invalid_argument("Choice with image assets needs a named criteria object");
         }
-        for (const char * field : { "instructions", "criteria" }) {
-            if (question.contains(field)) {
-                questions_changed |= bind(bind, question.at(field), 0);
-            }
+        std::optional<size_t> target;
+        if (question.contains("instructions")) {
+            questions_changed |= bind(bind, question.at("instructions"), 0, type == "box" && names.size() > 1 ? &target : nullptr);
+        }
+        if (question.contains("criteria")) {
+            questions_changed |= bind(bind, question.at("criteria"), 0, nullptr);
+        }
+        if (target) {
+            assets.box_images.emplace(id, *target);
         }
     }
     if (std::find(used.begin(), used.end(), false) != used.end()) {
@@ -383,7 +495,7 @@ server_decision_assets server_decision_bind_assets(const server_http_req & req, 
 }
 
 std::vector<size_t> server_decision_assets::resolve(
-        std::string & text, std::vector<std::pair<size_t, size_t>> & spans) const {
+        std::string & text, std::vector<std::pair<size_t, size_t>> & spans, std::optional<size_t> only_image) const {
     std::vector<size_t> order;
     std::string rendered;
     size_t offset = 0, span = 0;
@@ -405,11 +517,14 @@ std::vector<size_t> server_decision_assets::resolve(
         if (end == std::string::npos) {
             throw std::runtime_error("invalid bound image reference");
         }
-        order.push_back(std::stoul(text.substr(start, end - start)));
-        rendered += get_media_marker();
+        const size_t index = std::stoul(text.substr(start, end - start));
+        if (!only_image || index == *only_image) {
+            order.push_back(index);
+            rendered += get_media_marker();
+        }
         offset = end + 1;
     }
-    if (!order.empty()) {
+    if (offset != 0) {
         append_text(text.size());
         text = std::move(rendered);
     }

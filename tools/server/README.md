@@ -2086,6 +2086,8 @@ With a trained single-box head, a question such as `{"type":"box","instructions"
 
 Send `TypeSafe-Danger-Zone-Images: true` and an `assets` object. The server inserts each image wherever its asset name appears in a string value in `state`, `instructions`, or `criteria`. An inline asset has `format` and `data_base64`. A multipart asset has a `part` matching the upload field name. Both accept an optional `type: "image"`. Send the JSON body in the multipart `request` part.
 
+When a Box question has several images in its input, name one target image by its state path in backticks, such as `views[0].photo`. The single-box head receives that image and the text. Each Box question in the request can select a different image.
+
 ```shell
 curl -fsS http://127.0.0.1:9931/v1/systemone \
   -H 'TypeSafe-Danger-Zone-Images: true' \
@@ -2096,6 +2098,10 @@ curl -fsS http://127.0.0.1:9931/v1/systemone \
 Use distinct placeholder names such as UUIDs. Still PNG and JPEG images can be 280 to 1568 pixels on each side and up to 16 MiB per file. Image requests and expanded image references have a 32 MiB budget. The effective prompt of each Box question must contain one distinct image. A request can include separate Box questions for different images. A multipart request with only inline assets can carry just the JSON `request` part.
 
 Asset requests default to the TypeSafe response fields and confidence formulas. Choice confidence is measured above the uniform baseline. Score confidence uses the probability-weighted distance from the most likely level, and its legend preserves structured criteria. Noul reports `type` and `noul`. A Laya Noul question can omit `instructions` if it supplies a nonempty criterion. Use `LAYA_JEV_STRICT=1` at server startup to select this response for text requests too. Clients can select `typesafe` or `legacy` with the `X-Laya-Response-Schema` header. Existing `files` and `images` requests default to the legacy response when that setting is unset.
+
+Legacy Score legends preserve the original asset references in their text descriptions.
+
+Laya requests to `/v1/systemone` and `/v1/multimodal` allow up to 64 questions, 512 choice options and score levels combined, and 65,536 input tokens summed across the inference tasks. The entire request is validated before submitting tasks.
 
 #### POST `/v1/multimodal`
 

@@ -6594,7 +6594,10 @@ void server_routes::init_routes() {
             return res;
         }
         const bool typesafe_response = server_decision_typesafe_response(req, has_assets, native_media);
-        const json original_questions = typesafe_response && body.contains("questions") ? body.at("questions") : json();
+        if (decision.is_laya_multimodal() && !has_assets && !native_media) {
+            server_decision_check_request_limits(body);
+        }
+        const json original_questions = has_assets ? body.at("questions") : json();
         const json min_confidence = native_media ? body.value("min_confidence", json()) : json();
         server_decision_validate_confidence(min_confidence);
         if (body.contains("cache_prompt") && !body.at("cache_prompt").is_boolean()) {
@@ -6661,6 +6664,7 @@ void server_routes::init_routes() {
                     tasks.push_back(std::move(task));
                 }
             } else {
+                size_t input_tokens = 0;
                 for (size_t i = 0; i < questions.size(); ++i) {
                     const auto & question = questions[i];
                     for (size_t variant = 0; variant < decision.n_variants(question); variant++) {
@@ -6672,6 +6676,9 @@ void server_routes::init_routes() {
                         }
                         if (request_max_len && task.tokens.size() > request_max_len) {
                             throw std::invalid_argument("multimodal input exceeds max_len");
+                        }
+                        if (decision.is_laya_multimodal()) {
+                            server_decision_add_input_tokens(input_tokens, task.tokens.size());
                         }
                         tasks.push_back(std::move(task));
                     }
@@ -6721,8 +6728,9 @@ void server_routes::init_routes() {
                 scores.push_back(result->scores);
                 n_tokens += result->n_tokens;
             }
-            answers[question.id] = decision.format_answer(question, scores, question_modalities[i],
-                    typesafe_response ? &original_questions.at(question.id) : nullptr);
+            const json * original_criteria = has_assets && question.type == SERVER_DECISION_QUESTION_SCORE ?
+                &original_questions.at(question.id).at("criteria") : nullptr;
+            answers[question.id] = decision.format_answer(question, scores, question_modalities[i], typesafe_response, original_criteria);
             server_decision_apply_confidence(answers[question.id], min_confidence);
         }
 

@@ -1614,14 +1614,22 @@ void server_decision_context::fill_task_laya_multimodal(
     }
     std::vector<size_t> image_order;
     const bool inline_assets = assets && assets->prefix_order.empty();
+    size_t prefix_images = input.files.size();
     if (assets) {
-        image_order = inline_assets ? assets->resolve(text, spans) : assets->prefix_order;
+        const auto target = assets->box_images.find(question.id);
+        const auto selected = target == assets->box_images.end() ? std::nullopt : std::optional<size_t>(target->second);
+        if (inline_assets) {
+            image_order = assets->resolve(text, spans, selected);
+            prefix_images = 0;
+        } else {
+            image_order = selected ? std::vector<size_t>{*selected} : assets->prefix_order;
+            prefix_images = image_order.size();
+        }
         if (is_box && (image_order.empty() ||
                 std::any_of(image_order.begin(), image_order.end(), [&](size_t index) { return index != image_order.front(); }))) {
-            throw std::invalid_argument("each Box question must reference a single image");
+            throw std::invalid_argument("Box needs one image or a single target image path in backticks");
         }
     }
-    const size_t prefix_images = assets ? assets->prefix_order.size() : input.files.size();
     const json images = std::vector<std::string>(prefix_images, marker);
     const std::string prompt = decision_apply_template(*tmpl, {{"images", images}, {"prompt", text}});
     task.tokens = input.tokenize(prompt, laya_config.value("add_special", false), assets ? &image_order : nullptr);
@@ -2156,7 +2164,7 @@ static void decision_laya_ordinal(std::vector<double> & probs, const json & prof
 
 json server_decision_context::format_answer(
         const server_decision_question & question, const std::vector<std::vector<float>> & scores,
-        const std::string & modality, const json * typesafe_question) const {
+        const std::string & modality, bool typesafe_response, const json * original_criteria) const {
     const size_t n = n_outputs(question);
     if (scores.size() != n_variants(question)) {
         throw std::runtime_error("decision result does not match the number of variants");
@@ -2243,14 +2251,14 @@ json server_decision_context::format_answer(
         if (!std::all_of(probs.begin(), probs.end(), [](double p) { return std::isfinite(p); })) {
             throw std::runtime_error("nonfinite Laya decision probabilities");
         }
-        if (!typesafe_question) {
+        if (!typesafe_response) {
             answer["calibrated"] = calibrated;
             answer["answer_confidence"] = *std::max_element(probs.begin(), probs.end());
         }
     }
 
     if (question.type == SERVER_DECISION_QUESTION_NOUL) {
-        if (is_laya_multimodal() && !typesafe_question) {
+        if (is_laya_multimodal() && !typesafe_response) {
             answer["confidence"] = answer.at("answer_confidence");
         }
         if (type == COMMON_DECISION_TYPE_LEV) {
@@ -2279,19 +2287,19 @@ json server_decision_context::format_answer(
         const auto & opt = question.options[best];
         answer["choice"]        = opt.label.is_null() ? json(opt.key) : opt.label;
         answer["probabilities"] = probabilities;
-        answer["confidence"]    = typesafe_question ? decision_confidence_choice(probs) : get_decision_confidence(question.type, probs);
+        answer["confidence"]    = typesafe_response ? decision_confidence_choice(probs) : get_decision_confidence(question.type, probs);
     } else {
         double expected = 0.0;
         json legend = json::object();
         for (size_t i = 0; i < n; i++) {
             expected += i * probs[i];
-            const json & description = question.options[i].description;
-            legend[question.options[i].key] = typesafe_question ? typesafe_question->at("criteria").at(i) :
+            const json & description = original_criteria ? original_criteria->at(i) : question.options[i].description;
+            legend[question.options[i].key] = typesafe_response ? description :
                 is_laya_multimodal() ? json(decision_laya_text(description)) :
                 canonical_legend && !description.is_string() ? json(decision_sort_keys(description).dump()) : description;
         }
         // lfm3-d1: the median level, the first whose cumulative probability reaches one half (d1 api.py)
-        if (is_lfm3_d1() && !typesafe_question) {
+        if (is_lfm3_d1() && !typesafe_response) {
             double mass = 0.0;
             size_t level = n - 1;
             for (size_t i = 0; i < n && mass < 0.5; i++) {
@@ -2303,7 +2311,7 @@ json server_decision_context::format_answer(
         answer["score"]         = expected;
         answer["legend"]        = legend;
         answer["probabilities"] = probabilities;
-        answer["confidence"]    = typesafe_question ? decision_confidence_score(probs) : get_decision_confidence(question.type, probs);
+        answer["confidence"]    = typesafe_response ? decision_confidence_score(probs) : get_decision_confidence(question.type, probs);
     }
     return answer;
 }

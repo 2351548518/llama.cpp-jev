@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,11 +15,15 @@ struct server_http_req;
 struct server_decision_assets {
     std::string marker;
     std::vector<size_t> prefix_order;
+    std::map<std::string, size_t> box_images;
 
-    std::vector<size_t> resolve(std::string & text, std::vector<std::pair<size_t, size_t>> & spans) const;
+    std::vector<size_t> resolve(std::string & text, std::vector<std::pair<size_t, size_t>> & spans,
+            std::optional<size_t> only_image = std::nullopt) const;
 };
 
 json server_decision_request_json(const server_http_req & req, bool native_media = false);
+void server_decision_check_request_limits(const json & body);
+void server_decision_add_input_tokens(size_t & total, size_t tokens);
 bool server_decision_typesafe_response(const server_http_req & req, bool has_assets, bool native_media);
 server_decision_assets server_decision_bind_assets(const server_http_req & req, json & body,
         std::vector<raw_buffer> & files, const mtmd_helper_init_opt & options);
@@ -162,7 +167,7 @@ struct server_decision_context {
 
     // scores: the raw model outputs of each variant
     json format_answer(const server_decision_question & question, const std::vector<std::vector<float>> & scores,
-            const std::string & modality = "text", const json * typesafe_question = nullptr) const;
+            const std::string & modality = "text", bool typesafe_response = false, const json * original_criteria = nullptr) const;
 
 private:
     const llama_vocab * vocab = nullptr;

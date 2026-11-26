@@ -136,3 +136,35 @@ def test_laya_assets(tmp_path, monkeypatch, router):
     ])
     assert uploaded.status_code == 200
     assert uploaded.json()["answers"]["target"]["box"] == pytest.approx(route.body["answers"]["target"]["box"], abs=3e-5)
+
+    two_views = [{"image": "black-ref"}, {"image": "white-ref"}]
+    boxes = {
+        "first": {"type": "box", "instructions": "Locate the darker region in `views[0].image`."},
+        "second": {"type": "box", "instructions": "Locate the brighter region in `views[1].image`."},
+    }
+    with_two_images = {"model": "jev", "state": {"views": two_views}, "questions": boxes, "assets": body["assets"]}
+    multi = server.make_request("POST", "/v1/systemone", with_two_images, headers=header)
+    assert multi.status_code == 200
+    for index, (qid, box_question) in enumerate(boxes.items()):
+        ref = two_views[index]["image"]
+        views = [view if i == index else {"image": ""} for i, view in enumerate(two_views)]
+        control = {"model": "jev", "state": {"views": views}, "questions": {qid: box_question},
+                   "assets": {ref: body["assets"][ref]}}
+        single = server.make_request("POST", "/v1/systemone", control, headers=header)
+        assert single.status_code == 200
+        assert multi.body["answers"][qid]["box"] == pytest.approx(single.body["answers"][qid]["box"], abs=3e-5)
+
+    ambiguous = {**with_two_images, "questions": question}
+    assert server.make_request("POST", "/v1/systemone", ambiguous, headers=header).status_code == 400
+
+    criteria = [{"level": "dark", "example": "black-ref"}, {"level": "bright", "example": "white-ref"}]
+    score = {
+        "model": "jev",
+        "state": "An example to rate.",
+        "questions": {"rating": {"type": "score", "instructions": "Which level is the closer match?", "criteria": criteria}},
+        "assets": body["assets"],
+    }
+    legacy = server.make_request("POST", "/v1/systemone", score, headers={**header, "X-Laya-Response-Schema": "legacy"})
+    assert legacy.status_code == 200
+    legend = legacy.body["answers"]["rating"]["legend"]
+    assert [json.loads(legend[str(i)]) for i in range(len(criteria))] == criteria

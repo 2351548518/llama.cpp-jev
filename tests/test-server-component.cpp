@@ -753,17 +753,89 @@ static void test_decision_typesafe_request(testing & t) {
     t.assert_true("asset order follows the prompt", order == std::vector<size_t>{1, 0});
     t.assert_true("candidate spans follow media replacements", spans[0].first == prompt.find(" ->") &&
             spans[1].first == prompt.rfind(" ->") && spans[0].second == spans[0].first + 3);
+
+    req.multipart = false;
+    req.files.clear();
+    req.headers["typesafe-danger-zone-images"] = "true";
+    body = request;
+    body["assets"]["other"] = image;
+    body["state"] = {{"views", json::array({{{"image", "photo"}}, {{"image", "other"}}})}};
+    body["questions"]["q"]["instructions"] = {{"locate", "the target in `views[1].image`"}};
+    files.clear();
+    assets = server_decision_bind_assets(req, body, files, mtmd_helper_init_opt_default());
+    t.assert_true("Box resolves the named nested array field", assets.box_images.at("q") == 1);
+    prompt = body.at("state").dump();
+    spans.clear();
+    t.assert_true("Box keeps only its selected image", assets.resolve(prompt, spans, assets.box_images.at("q")) == std::vector<size_t>{1} &&
+            prompt.find(assets.marker) == std::string::npos);
+
+    body = request;
+    body["assets"]["other"] = image;
+    body["state"] = json::array({"other", "photo", "Scene shown"});
+    body["questions"]["q"]["instructions"] = "the target in `[0]`";
+    files.clear();
+    assets = server_decision_bind_assets(req, body, files, mtmd_helper_init_opt_default());
+    t.assert_true("Box resolves a prefix image before simplifying state", assets.box_images.at("q") == 1 &&
+            assets.prefix_order == std::vector<size_t>{1, 0} && body.at("state") == "Scene shown");
+}
+
+static void test_decision_request_limits(testing & t) {
+    const std::function<bool()> connected = [] { return false; };
+    json questions = json::object();
+    const json noul = {{"type", "noul"}, {"instructions", "Is the light on?"}};
+    for (size_t index = 0; index < 64; ++index) {
+        questions[std::to_string(index)] = noul;
+    }
+    json body = {{"questions", questions}};
+    server_http_req req = {{}, {}, "/v1/multimodal", "", body.dump(), {}, connected};
+    t.assert_true("question count at the limit is accepted", server_decision_request_json(req, true) == body);
+    body["questions"]["extra"] = noul;
+    req.body = body.dump();
+    bool rejected = false;
+    try {
+        server_decision_request_json(req, true);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    t.assert_true("native media checks question count before decoding", rejected);
+
+    json criteria = json::object();
+    for (size_t index = 0; index < 256; ++index) {
+        criteria[std::to_string(index)] = "a category";
+    }
+    const json choice = {{"type", "choice"}, {"instructions", "Pick a category"}, {"criteria", criteria}};
+    body = {{"questions", {{"first", choice}, {"second", choice}}}};
+    server_decision_check_request_limits(body);
+    body["questions"]["extra"] = {{"type", "score"}, {"criteria", json::array({"low", "high"})}};
+    rejected = false;
+    try {
+        server_decision_check_request_limits(body);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    t.assert_true("choice and score options share the request limit", rejected);
+
+    size_t tokens = 0;
+    server_decision_add_input_tokens(tokens, 32768);
+    server_decision_add_input_tokens(tokens, 32768);
+    rejected = false;
+    try {
+        server_decision_add_input_tokens(tokens, 1);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    t.assert_true("combined task input is bounded", rejected && tokens == 65536);
 }
 
 static void test_decision_typesafe_confidence(testing & t) {
     server_decision_context ctx;
     ctx.type = COMMON_DECISION_TYPE_VLLM_D3;
     const json structured = {{"level", "middle"}};
-    const json request = {{"criteria", json::array({"low", structured, "high"})}};
+    const json criteria = json::array({"low", structured, "high"});
     const server_decision_question score = {"q", SERVER_DECISION_QUESTION_SCORE, "rating",
         {{"0", "low"}, {"1", "middle"}, {"2", "high"}}};
     const auto legacy = ctx.format_answer(score, {{0.0f, 3.0f, 1.0f}});
-    const auto strict = ctx.format_answer(score, {{0.0f, 3.0f, 1.0f}}, "text", &request);
+    const auto strict = ctx.format_answer(score, {{0.0f, 3.0f, 1.0f}}, "text", true, &criteria);
     const auto & p = strict.at("probabilities");
     const double expected = 1.0 - (p.at("0").get<double>() + p.at("2").get<double>()) / (2.0 / 3.0);
     t.assert_true("TypeSafe uses the mode distance and structured legend", strict.at("legend").at("1") == structured &&
@@ -1078,6 +1150,7 @@ int main(int argc, char ** argv) {
     t.test("decision_class_scores", test_decision_class_scores);
     t.test("decision_laya_box", test_decision_laya_box);
     t.test("decision_typesafe_request", test_decision_typesafe_request);
+    t.test("decision_request_limits", test_decision_request_limits);
     t.test("decision_typesafe_confidence", test_decision_typesafe_confidence);
     t.test("decision_ocr_jev_validation", test_decision_ocr_jev_validation);
     t.test("decision_depth",  test_decision_depth);
