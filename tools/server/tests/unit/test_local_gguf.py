@@ -32,7 +32,7 @@ def local_server():
 def test_generative_gguf(weight_env):
     model = os.environ.get(weight_env)
     if not model:
-        pytest.skip(f"set {weight_env} to a local generative GGUF")
+        pytest.skip(f"set {weight_env} to a local generative GGUF")  # ty: ignore[too-many-positional-arguments]
     server = local_server()
     server.model_file = model
     server.start()
@@ -53,7 +53,7 @@ def test_laya_assets(tmp_path, monkeypatch, router):
     model = os.environ.get("LLAMA_LAYA_GGUF")
     projector = os.environ.get("LLAMA_LAYA_MMPROJ")
     if not model or not projector:
-        pytest.skip("requires a local Laya decision GGUF and its matching mmproj")
+        pytest.skip("requires a local Laya decision GGUF and its matching mmproj")  # ty: ignore[too-many-positional-arguments]
     server = local_server()
     monkeypatch.delenv("LAYA_JEV_STRICT", raising=False)
     if router:
@@ -95,6 +95,20 @@ def test_laya_assets(tmp_path, monkeypatch, router):
                            files=[("request", (None, json.dumps(body), "application/json"))])
     assert inline.status_code == 200
     assert inline.json() == response.body
+
+    criteria_only = {
+        "model": "jev",
+        "state": ["black-ref", "Inspect the image."],
+        "questions": {"visible": {"type": "noul", "criteria": {"true": "The image is black."}}},
+        "assets": {"black-ref": body["assets"]["black-ref"]},
+    }
+    response = server.make_request("POST", "/v1/systemone", criteria_only, headers=header)
+    assert response.status_code == 200
+    visible = response.body["answers"]["visible"]
+    assert set(visible) == {"type", "noul"}
+    assert visible["type"] == "noul" and 0 <= visible["noul"] <= 1
+    criteria_only["questions"]["visible"]["criteria"] = {"true": " "}
+    assert server.make_request("POST", "/v1/systemone", criteria_only, headers=header).status_code == 400
 
     long_choice = {"type": "choice", "instructions": "Which criterion agrees with the state?",
                    "criteria": {"A": "The state reports a duplicate charge.", "B": "The transaction was successful. " * 220}}

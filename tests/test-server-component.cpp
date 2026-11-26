@@ -777,6 +777,15 @@ static void test_decision_typesafe_confidence(testing & t) {
     t.assert_true("confidence gate uses the option-count bucket", gated.at("abstention") == "abstained" &&
             gated.at("abstention_threshold") == 1.0 && gated.at("low_confidence") == true &&
             gated.at("probabilities") == p);
+
+    json choice = {{"type", "choice"}, {"confidence", 0.5}, {"probabilities", {{"a", 0.75}, {"b", 0.25}}}};
+    auto legacy_choice = choice;
+    legacy_choice["answer_confidence"] = 0.75;
+    server_decision_apply_confidence(choice, 0.6);
+    server_decision_apply_confidence(legacy_choice, 0.6);
+    t.assert_true("TypeSafe applies the reported confidence",
+            choice.at("abstention") == "abstained" && choice.at("low_confidence") == true);
+    t.assert_true("legacy uses its answer confidence", legacy_choice.at("abstention") == "passed");
 }
 
 //

@@ -172,18 +172,14 @@ void server_decision_apply_confidence(json & answer, const json & limit) {
         const auto bucket = count <= 2 ? "2" : count <= 5 ? "3-5" : count <= 10 ? "6-10" : "11+";
         threshold = limit.value(type + ":" + bucket, threshold);
     }
-    double confidence = 0.;
+    double confidence;
     if (answer.contains("answer_confidence")) {
         confidence = answer.at("answer_confidence").get<double>();
-    } else if (type == "noul") {
-        const double p = answer.at("noul").get<double>();
-        confidence = std::max(p, 1. - p);
-    } else if (type == "box") {
+    } else if (answer.contains("confidence")) {
         confidence = answer.at("confidence").get<double>();
     } else {
-        for (const auto & p : answer.at("probabilities")) {
-            confidence = std::max(confidence, p.get<double>());
-        }
+        const double p = answer.at("noul").get<double>();
+        confidence = std::max(p, 1. - p);
     }
     answer["abstention_threshold"] = threshold;
     answer["abstention"] = confidence < threshold ? "abstained" : "passed";

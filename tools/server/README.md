@@ -2095,11 +2095,13 @@ curl -fsS http://127.0.0.1:9931/v1/systemone \
 
 Use distinct placeholder names such as UUIDs. Still PNG and JPEG images can be 280 to 1568 pixels on each side and up to 16 MiB per file. Image requests and expanded image references have a 32 MiB budget. The effective prompt of each Box question must contain one distinct image. A request can include separate Box questions for different images. A multipart request with only inline assets can carry just the JSON `request` part.
 
-Asset requests default to the TypeSafe response fields and confidence formulas. Choice confidence is measured above the uniform baseline. Score confidence uses the probability-weighted distance from the most likely level, and its legend preserves structured criteria. Noul reports `type` and `noul`. Use `LAYA_JEV_STRICT=1` at server startup to select this response for text requests too. Clients can select `typesafe` or `legacy` with the `X-Laya-Response-Schema` header. Existing `files` and `images` requests default to the legacy response when that setting is unset.
+Asset requests default to the TypeSafe response fields and confidence formulas. Choice confidence is measured above the uniform baseline. Score confidence uses the probability-weighted distance from the most likely level, and its legend preserves structured criteria. Noul reports `type` and `noul`. A Laya Noul question can omit `instructions` if it supplies a nonempty criterion. Use `LAYA_JEV_STRICT=1` at server startup to select this response for text requests too. Clients can select `typesafe` or `legacy` with the `X-Laya-Response-Schema` header. Existing `files` and `images` requests default to the legacy response when that setting is unset.
 
 #### POST `/v1/multimodal`
 
 Laya checkpoints also accept one `image`, `video`, or `audio` object with a `base64` string of file bytes, plus `questions` and optional `state`, `max_len`, and `min_confidence`. The server rejects inputs exceeding `max_len` after tokenization. Set `min_confidence` to a number from 0 to 1 or a map with keys such as `choice:3-5` and `default`. The response includes `modality`, `usage.forward_passes`, and `usage.truncated`.
+
+The threshold uses `answer_confidence` when the legacy response includes it, and otherwise uses `confidence`. For a TypeSafe Noul response it uses the larger of `noul` and `1 - noul`.
 
 The checkpoint and its matching `--mmproj` determine the media capabilities. For both Qwen3.5-4B v1 and v4, use still images or video frames. Audio requires a checkpoint with an audio encoder.
 

@@ -323,7 +323,16 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         // the vllm-d3 prompt has a default question
         // h2o-lightning: the instructions can be left out, the template has a default, and the type defaults to choice
         const bool is_h2o = type == COMMON_DECISION_TYPE_H2O_LIGHTNING;
-        const json instructions = q.contains("instructions") ? q.at("instructions") : (is_h2o ? json(std::string()) : json());
+        const std::string type_name = json_value(q, "type", std::string(is_h2o ? "choice" : ""));
+        json criteria = q.value("criteria", json());
+        json instructions = q.value("instructions", is_h2o ? json(std::string()) : json());
+        if (is_laya_multimodal() && type_name == "noul" && instructions.is_null() && criteria.is_object() &&
+                std::any_of(criteria.begin(), criteria.end(), [](const json & value) {
+                    return decision_is_payload(value) && !value.empty() &&
+                        (!value.is_string() || !string_strip(value.get<std::string>()).empty());
+                })) {
+            instructions = "Which criterion matches the state?";
+        }
         // minicpm-ocr-jev answers one fixed question, the prompt is entirely in the template
         const bool is_ocr_jev = type == COMMON_DECISION_TYPE_MINICPM_OCR_JEV;
         if (instructions.is_null() && type != COMMON_DECISION_TYPE_VLLM_D3 && !is_h2o && !is_ocr_jev) {
@@ -348,8 +357,6 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
         question.id           = id;
         question.instructions = instructions;
 
-        const std::string type_name = json_value(q, "type", std::string(is_h2o ? "choice" : ""));
-        json              criteria  = q.contains("criteria") ? q.at("criteria") : json();
         if (is_laya_multimodal() && (type_name == "choice" || type_name == "score") && criteria.size() > n_options_max) {
             throw err(string_format("too many options (%zu), this model supports at most %zu", criteria.size(), n_options_max));
         }
