@@ -35,6 +35,7 @@ def get_prompt_metrics(server: ServerProcess) -> tuple[int, int]:
     """returns the number of prompt tokens (processed, cached) since the server started"""
     res = server.make_request("GET", "/metrics")
     assert res.status_code == 200
+    assert isinstance(res.body, str), "expected Prometheus text from /metrics"
     values = {}
     for line in res.body.splitlines():
         if line.startswith("llamacpp:"):

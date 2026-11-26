@@ -11,6 +11,8 @@ Benchmark is using [k6](https://k6.io/).
 {"id":"locate","kind":"image/box","media_paths":["example.jpg"],"body":{"questions":{"target":{"type":"box","instructions":"the red cup"}}}}
 ```
 
+Requests with inline `assets` in the body use the TypeSafe image opt-in header automatically. Use `media_paths` for legacy `files` requests.
+
 ```sh
 python tools/server/bench/bench_systemone.py --inputs requests.jsonl --output cold.json --repeat 5
 python tools/server/bench/bench_systemone.py --inputs requests.jsonl --output cached.json --repeat 5 --cache-prompt --compare cold.json

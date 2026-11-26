@@ -16,9 +16,12 @@ def request(url, body, timeout):
     address = urlsplit(url)
     connection_type = http.client.HTTPSConnection if address.scheme == "https" else http.client.HTTPConnection
     connection = connection_type(address.hostname, address.port, timeout=timeout)
+    headers = {"Content-Type": "application/json"}
+    if body.get("assets"):
+        headers["TypeSafe-Danger-Zone-Images"] = "true"
     try:
         connection.request("POST", address.path.rstrip("/") + "/v1/systemone",
-                           json.dumps(body, ensure_ascii=False).encode(), {"Content-Type": "application/json"})
+                           json.dumps(body, ensure_ascii=False).encode(), headers)
         response = connection.getresponse()
         data = response.read()
         if response.status != 200:
@@ -48,8 +51,10 @@ def validate(answer):
                 raise ValueError("Decision probabilities are not normalized")
             if kind == "score" and (not math.isfinite(result["score"]) or not 0 <= result["score"] <= len(values) - 1):
                 raise ValueError("Invalid expected score")
-        if not math.isfinite(result["confidence"]) or not 0 <= result["confidence"] <= 1:
-            raise ValueError("Invalid confidence")
+        if kind != "noul" or "confidence" in result:
+            confidence = result["confidence"]
+            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise ValueError("Invalid confidence")
 
 
 def maximum_difference(left, right):
@@ -112,6 +117,8 @@ def main():
     cases = load_cases(args.inputs)
     reference = json.loads(args.compare.read_text())["cases"] if args.compare else None
     results = {}
+    latencies: list[float] = []
+    warmup_failures = 0
     for item in cases:
         body = dict(item["body"], cache_prompt=args.cache_prompt)
         elapsed, errors, answer, drift = [], [], None, 0.0
@@ -127,7 +134,9 @@ def main():
                 if index >= args.warmup:
                     elapsed.append(duration * 1000)
             except (OSError, ValueError, KeyError, RuntimeError, http.client.HTTPException) as error:
-                errors.append({"iteration": index, "warmup": index < args.warmup, "error": str(error)})
+                warmup = index < args.warmup
+                errors.append({"iteration": index, "warmup": warmup, "error": str(error)})
+                warmup_failures += warmup
         if reference is not None:
             expected = reference[item["id"]]
             if expected["request_sha256"] != item["request_sha256"]:
@@ -138,14 +147,14 @@ def main():
                                "answers": answer, "latency_ms": elapsed, "errors": errors,
                                "maximum_answer_difference": drift if math.isfinite(drift) else None,
                                "within_tolerance": drift <= args.tolerance}
+        latencies.extend(elapsed)
         print(item["id"], "successful", len(elapsed), "errors", len(errors), flush=True)
-    latencies = [duration for item in results.values() for duration in item["latency_ms"]]
     planned = len(cases) * args.repeat
     report = {"protocol": "Sequential end-to-end decision requests; warmups excluded from latency; failures retained in success rate",
               "request_hash_scheme": "ordered-systemone-v1", "manifest_sha256": hashlib.sha256(args.inputs.read_bytes()).hexdigest(),
               "cache_prompt": args.cache_prompt, "repeat": args.repeat, "warmup": args.warmup,
               "planned": planned, "successful": len(latencies), "success_rate": len(latencies) / planned,
-              "warmup_failures": sum(error["warmup"] for item in results.values() for error in item["errors"]),
+              "warmup_failures": warmup_failures,
               "p50_ms": percentile(latencies, 0.5), "p95_ms": percentile(latencies, 0.95),
               "mean_ms": statistics.mean(latencies) if latencies else None, "cases": results,
               "comparison_tolerance": args.tolerance, "device_label": args.device_label}
