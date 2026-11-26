@@ -146,12 +146,11 @@ option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
-# Tests read this setting before the mtmd target is added.
-set(MTMD_VIDEO_HELP "enable video support in mtmd (requires ffmpeg binary in PATH)")
-set(MTMD_VIDEO ON CACHE BOOL "${MTMD_VIDEO_HELP}")
+# Keep the requested setting when subprocess support is temporarily disabled.
+option(MTMD_VIDEO "enable video support in mtmd (requires ffmpeg binary in PATH)" ON)
 if (MTMD_VIDEO AND NOT LLAMA_SUBPROCESS)
     message(STATUS "Disabling MTMD_VIDEO because LLAMA_SUBPROCESS is OFF")
-    set(MTMD_VIDEO OFF CACHE BOOL "${MTMD_VIDEO_HELP}" FORCE)
+    set(MTMD_VIDEO OFF)
 endif()
 
 # Required for relocatable CMake package
@@ -251,7 +250,6 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
     include(CTest)
-    add_subdirectory(tests)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES)
@@ -269,12 +267,14 @@ endif()
 
 # Standalone libmtmd build without pulling in the rest of the tools/ tree.
 # Useful when packaging just the mtmd library for language bindings (e.g. an
-# Apple XCFramework, or a WASM build). When the full tools build is enabled,
-# mtmd is already built by the tools/ subdirectory above; this hook only fires
-# when LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
+# Apple XCFramework, or a WASM build).
 option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
-if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+if (LLAMA_BUILD_MTMD AND NOT TARGET mtmd)
     add_subdirectory(tools/mtmd)
+endif()
+
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
+    add_subdirectory(tests)
 endif()
 
 llama_apply_app_manifests()
