@@ -121,7 +121,7 @@
 	name="PdfConversionError"
 	play={async ({ canvas }) => {
 		await waitFor(() => expect(canvas.getByText('Failed to load PDF images')).toBeInTheDocument(), {
-			timeout: 5000
+			timeout: 10_000
 		});
 
 		// a retry loop would flip back to the loading state

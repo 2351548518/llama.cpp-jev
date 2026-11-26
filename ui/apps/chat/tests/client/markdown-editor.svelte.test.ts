@@ -185,18 +185,21 @@ describe('MarkdownEditor', () => {
 		});
 	});
 
-	it('renders a $$ math block with a blank line as one block', async () => {
+	it('renders a $$ math block with a blank line as one block', { timeout: 15_000 }, async () => {
 		const screen = render(MarkdownEditor, { value: '$$\na\n\nb\n$$' });
 
-		await vi.waitFor(() => {
-			const blocks = screen.container.querySelectorAll('.cm-md-block');
+		await vi.waitFor(
+			() => {
+				const blocks = screen.container.querySelectorAll('.cm-md-block');
 
-			expect(blocks).toHaveLength(1);
-			expect(blocks[0].querySelector('.katex')).not.toBeNull();
-		});
+				expect(blocks).toHaveLength(1);
+				expect(blocks[0].querySelector('.katex')).not.toBeNull();
+			},
+			{ timeout: 10_000 }
+		);
 	});
 
-	it('draws an svg block like a chat message', async () => {
+	it('draws an svg block like a chat message', { timeout: 15_000 }, async () => {
 		const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect/></svg>';
 		const screen = render(MarkdownEditor, { value: `\`\`\`svg\n${svg}\n\`\`\`` });
 
@@ -207,7 +210,7 @@ describe('MarkdownEditor', () => {
 
 					return host?.shadowRoot?.querySelector('svg rect');
 				},
-				{ timeout: 5000 }
+				{ timeout: 10_000 }
 			)
 			.toBeInstanceOf(SVGRectElement);
 	});

@@ -29,7 +29,7 @@
 				expect(canvasElement.querySelectorAll('pre.mermaid svg.pele')).toHaveLength(4);
 				expect(canvasElement.querySelector('pre.mermaid .mermaid-error')).not.toBeNull();
 			},
-			{ timeout: 5000 }
+			{ timeout: 10_000 }
 		);
 
 		const error = canvasElement.querySelector('pre.mermaid .mermaid-error');

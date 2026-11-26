@@ -85,6 +85,15 @@ describe('rehypeLazyHighlight', () => {
 		expect(processor.stringify(tree)).toBe('<p>Just <em>text</em> and <code>code</code></p>');
 	});
 
+	it('leaves an unknown fence language plain in the same pass', () => {
+		const markdown = '```not-a-language\nx = 1\n```';
+		const tree = processor.runSync(processor.parse(markdown)) as Root;
+
+		expect(processor.stringify(tree)).toBe(
+			'<pre><code class="hljs language-not-a-language">x = 1\n</code></pre>'
+		);
+	});
+
 	it('loads a block language, then highlights it in the same pass', async () => {
 		const markdown = '```rust\nfn main() {}\n```';
 		const first = await render(markdown);
@@ -108,10 +117,7 @@ describe('rehypeLazyHighlight', () => {
 		expect(await render('```svelte\n<div>{x}</div>\n```')).toContain('hljs-tag');
 	});
 
-	it('leaves unknown languages, no-highlight and blocks without a language plain', async () => {
-		expect(await render('```not-a-language\nx = 1\n```')).toBe(
-			'<pre><code class="hljs language-not-a-language">x = 1\n</code></pre>'
-		);
+	it('leaves blocks without a language plain', async () => {
 		expect(await render('```\nx = 1\n```')).toBe('<pre><code>x = 1\n</code></pre>');
 	});
 });

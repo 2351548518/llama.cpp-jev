@@ -1,4 +1,5 @@
 import { CONFIG_LOCALSTORAGE_KEY, STORAGE_APP_NAME } from '#lib/constants/index.ts';
+import { MigrationService } from '#lib/services/migration.service.ts';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 // node env unit project has no DOM, install a minimal localStorage backed by a Map
@@ -32,12 +33,10 @@ describe('mcp-default-overrides-merge-v1 migration', () => {
 	const MIGRATION_STATE_KEY = `${STORAGE_APP_NAME}.migration-state`;
 	const MCP_DEFAULT_OVERRIDES_KEY = `${STORAGE_APP_NAME}.mcpDefaultServerOverrides`;
 
-	beforeEach(async () => {
+	beforeEach(() => {
 		localStorage.clear();
 		// Reset the migration run counter so `runAllMigrations` is guaranteed to execute.
-		await import('#lib/services/migration.service.ts').then((mod) =>
-			mod.MigrationService.resetState()
-		);
+		MigrationService.resetState();
 	});
 
 	afterEach(() => {
@@ -45,8 +44,6 @@ describe('mcp-default-overrides-merge-v1 migration', () => {
 	});
 
 	async function runMigrations() {
-		const { MigrationService } = await import('#lib/services/migration.service.ts');
-
 		await MigrationService.runAllMigrations();
 	}
 

@@ -87,7 +87,7 @@ function registerLoadedLanguages(target: Lowlight): void {
 	}
 }
 
-function highlightBlocks(target: Lowlight, blocks: CodeBlock[]): void {
+function highlightBlocks(target: Lowlight | undefined, blocks: CodeBlock[]): void {
 	for (const { name, node } of blocks) {
 		const className = Array.isArray(node.properties.className)
 			? node.properties.className
@@ -95,7 +95,7 @@ function highlightBlocks(target: Lowlight, blocks: CodeBlock[]): void {
 
 		if (!className.includes(CODE_BLOCK_CLASS.HLJS)) className.unshift(CODE_BLOCK_CLASS.HLJS);
 
-		if (!name || !registered.has(name)) continue;
+		if (!target || !name || !registered.has(name)) continue;
 
 		const result = target.highlight(name, textContent(node));
 
@@ -135,7 +135,7 @@ export const rehypeLazyHighlight: Plugin<[LazyHighlightOptions?], Root> = (optio
 			...new Set(blocks.map((block) => block.name).filter((name) => name !== undefined))
 		];
 
-		if (lowlight && names.every((name) => registered.has(name))) {
+		if (!names.length || (lowlight && names.every((name) => registered.has(name)))) {
 			highlightBlocks(lowlight, blocks);
 
 			return;

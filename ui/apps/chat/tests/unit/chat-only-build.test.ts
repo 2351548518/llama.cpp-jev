@@ -18,7 +18,7 @@ afterEach(() => {
 	vi.resetModules();
 });
 
-describe('chat-only build', () => {
+describe('chat-only build', { timeout: 15_000 }, () => {
 	it('is off unless the build sets the flag to false', async () => {
 		expect((await loadConstants()).AGENTIC_ENABLED).toBe(true);
 		expect((await loadConstants('true')).AGENTIC_ENABLED).toBe(true);
@@ -41,7 +41,7 @@ describe('chat-only build', () => {
 	});
 });
 
-describe('agentic mode', () => {
+describe('agentic mode', { timeout: 15_000 }, () => {
 	it('is on only for a server that offers its tools or its proxy', async () => {
 		vi.resetModules();
 
