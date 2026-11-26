@@ -146,6 +146,13 @@ option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# Tests read this setting before the mtmd target is added.
+set(MTMD_VIDEO_HELP "enable video support in mtmd (requires ffmpeg binary in PATH)")
+set(MTMD_VIDEO ON CACHE BOOL "${MTMD_VIDEO_HELP}")
+if (MTMD_VIDEO AND NOT LLAMA_SUBPROCESS)
+    message(STATUS "Disabling MTMD_VIDEO because LLAMA_SUBPROCESS is OFF")
+    set(MTMD_VIDEO OFF CACHE BOOL "${MTMD_VIDEO_HELP}" FORCE)
+endif()
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
