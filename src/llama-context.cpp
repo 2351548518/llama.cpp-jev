@@ -495,13 +495,26 @@ llama_context::llama_context(
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-                if (backend == nullptr) {
-                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
-                }
-                backends.emplace_back(backend);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                continue;
             }
+            const bool initialized = std::any_of(backends.begin(), backends.end(), [dev](const ggml_backend_ptr & backend) {
+                return ggml_backend_get_device(backend.get()) == dev;
+            });
+            if (initialized) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            const auto requires_selection = reg ? reinterpret_cast<ggml_backend_dev_requires_explicit_selection_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_requires_explicit_selection")) : nullptr;
+            if (requires_selection && requires_selection(dev)) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+            }
+            backends.emplace_back(backend);
         }
 
         // add CPU backend

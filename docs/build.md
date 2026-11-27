@@ -28,6 +28,7 @@ The following sections describe how to build with different backends and options
 * [Android](#android-1)
 * [OpenVINO](#openvino)
 * [Hexagon](#hexagon)
+* [AMD XDNA](#amd-xdna)
 * [Notes about GPU-accelerated backends](#notes-about-gpu-accelerated-backends)
 
 ## CPU Build
@@ -903,6 +904,10 @@ For build instructions and usage examples, refer to [OPENVINO.md](backend/OPENVI
 ## Hexagon
 
 Check [README.md](./backend/snapdragon/README.md) for target specific build and run info.
+
+## AMD XDNA
+
+See [XDNA.md](backend/XDNA.md) for Windows and Linux builds and NPU kernel setup.
 
 ---
 ## Notes about GPU-accelerated backends

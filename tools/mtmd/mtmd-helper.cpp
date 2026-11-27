@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cinttypes>
 #include <climits>
+#include <stdexcept>
 #include <vector>
 
 //#define MTMD_AUDIO_DEBUG
